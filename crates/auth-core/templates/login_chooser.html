@@ -16,14 +16,18 @@
   h1 { font-size: 1.375rem; font-weight: 650; margin: 0 0 .25rem; }
   p.sub { color: #9b978f; margin: 0 0 2rem; font-size: .925rem; }
   ul.methods { list-style: none; margin: 0; padding: 0; display: grid; gap: .6rem; }
-  a.method {
-    display: block; padding: .8rem 1rem; border-radius: .6rem;
+  a.method, button.method {
+    display: block; width: 100%; padding: .8rem 1rem; border-radius: .6rem;
     background: #17171a; color: #EDEBE6; text-decoration: none; font-weight: 550;
     border: 1px solid #26262b; transition: border-color .15s ease;
+    font: inherit; font-weight: 550; cursor: pointer; text-align: center;
   }
-  a.method:hover, a.method:focus-visible { border-color: #FF5A36; outline: none; }
+  a.method:hover, a.method:focus-visible,
+  button.method:hover, button.method:focus-visible { border-color: #FF5A36; outline: none; }
+  button.method[disabled] { opacity: .6; cursor: progress; }
   p.none { color: #9b978f; background: #17171a; border: 1px dashed #26262b;
            border-radius: .6rem; padding: 1rem; }
+  p.error { color: #ffb4a2; margin: 1rem 0 0; font-size: .9rem; min-height: 1.4em; }
   footer { margin-top: 2rem; color: #6f6c66; font-size: .8rem; }
 </style>
 </head>
@@ -37,11 +41,133 @@
   {% else %}
   <ul class="methods">
     {% for method in methods %}
-    <li><a class="method" href="{{ method.href }}">{{ method.label }}</a></li>
+    {% if method.is_passkey %}
+    <li><button class="method" type="button" id="cf-passkey" data-method="{{ method.slug }}" data-return-to="{{ return_to }}" hidden>{{ method.label }}</button></li>
+    {% else %}
+    <li><a class="method" data-method="{{ method.slug }}" href="{{ method.href }}">{{ method.label }}</a></li>
+    {% endif %}
     {% endfor %}
   </ul>
+  <p class="error" id="cf-error" role="alert"></p>
   {% endif %}
   <footer>auth.factory0.ventures · Factory Zero</footer>
 </main>
+
+{% if has_passkey %}
+<script>
+// A passkey is the one method this page cannot hand off with a link.
+// A WebAuthn credential is bound to a relying-party id, and a browser
+// only runs a ceremony for an RP id matching the page it is on, so a
+// passkey registered here works on this origin and nowhere else. That is
+// why this script exists and why it is the only script here.
+//
+// The button starts hidden and is revealed only once the browser proves
+// it has WebAuthn: a button that cannot work should not be offered.
+(function () {
+  "use strict";
+  var button = document.getElementById("cf-passkey");
+  var error = document.getElementById("cf-error");
+  if (!button || !window.PublicKeyCredential || !navigator.credentials) return;
+  button.hidden = false;
+
+  // Read from a data attribute rather than interpolated into this script.
+  // `return_to` is a URL carrying the caller's own query parameters, so a
+  // value spliced into JavaScript would be an injection: the template's
+  // HTML escaping covers an attribute, and nothing covers a script body.
+  var RETURN_TO = button.getAttribute("data-return-to") || "/";
+
+  function fromBase64Url(value) {
+    var padded = value.replace(/-/g, "+").replace(/_/g, "/");
+    while (padded.length % 4) padded += "=";
+    var raw = atob(padded);
+    var bytes = new Uint8Array(raw.length);
+    for (var i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+    return bytes.buffer;
+  }
+
+  function toBase64Url(buffer) {
+    var bytes = new Uint8Array(buffer);
+    var binary = "";
+    for (var i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+
+  // Browsers from late 2023 do the conversion themselves. The manual path
+  // is for everything older, and is the reason this is not four lines.
+  function toRequestOptions(json) {
+    if (PublicKeyCredential.parseRequestOptionsFromJSON) {
+      return PublicKeyCredential.parseRequestOptionsFromJSON(json);
+    }
+    var options = Object.assign({}, json);
+    options.challenge = fromBase64Url(json.challenge);
+    options.allowCredentials = (json.allowCredentials || []).map(function (item) {
+      return Object.assign({}, item, { id: fromBase64Url(item.id) });
+    });
+    return options;
+  }
+
+  function toJson(credential) {
+    if (credential.toJSON) return credential.toJSON();
+    var response = credential.response;
+    return {
+      id: credential.id,
+      rawId: toBase64Url(credential.rawId),
+      type: credential.type,
+      clientExtensionResults: credential.getClientExtensionResults(),
+      response: {
+        clientDataJSON: toBase64Url(response.clientDataJSON),
+        authenticatorData: toBase64Url(response.authenticatorData),
+        signature: toBase64Url(response.signature),
+        userHandle: response.userHandle ? toBase64Url(response.userHandle) : null
+      }
+    };
+  }
+
+  function post(path, body) {
+    return fetch(path, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body)
+    });
+  }
+
+  button.addEventListener("click", function () {
+    error.textContent = "";
+    button.disabled = true;
+    // No email: the authenticator offers whatever discoverable credential
+    // it holds, which is the passwordless path.
+    post("/v1/auth-passkeys/login/options", {})
+      .then(function (response) {
+        if (!response.ok) throw new Error("options");
+        return response.json();
+      })
+      .then(function (options) {
+        return navigator.credentials.get({
+          publicKey: toRequestOptions(options.publicKey || options)
+        });
+      })
+      .then(function (credential) {
+        if (!credential) throw new Error("cancelled");
+        return post("/v1/auth-passkeys/login/verify", { credential: toJson(credential) });
+      })
+      .then(function (response) {
+        if (!response.ok) throw new Error("verify");
+        // The session cookie is set by the response above; this is the
+        // only navigation, and it goes back to the pending /authorize.
+        window.location.assign(RETURN_TO);
+      })
+      .catch(function (reason) {
+        button.disabled = false;
+        // Deliberately one message. The server answers every refusal
+        // identically so a caller cannot tell "no such credential" from
+        // "bad signature", and saying more here would undo that.
+        if (reason && reason.name === "NotAllowedError") return;
+        error.textContent = "That did not work. Try again, or use another method.";
+      });
+  });
+})();
+</script>
+{% endif %}
 </body>
 </html>

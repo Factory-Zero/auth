@@ -62,17 +62,33 @@ fn dummy_key(kid: &str) -> Value {
 }
 
 fn kit() -> TestHarness {
-    let config = MapConfig::from_pairs([
+    kit_with_methods(None)
+}
+
+/// The kit, optionally offering login methods on the chooser (#33).
+fn kit_with_methods(methods: Option<&str>) -> TestHarness {
+    let mut pairs = vec![
         (
             "AUTH_CORE_SIGNING_KEYS",
             serde_json::to_string(&vec![dummy_key("k1")]).expect("keys json"),
         ),
         ("AUTH_CORE_SIGNING_KEY_ACTIVE", "k1".to_owned()),
         ("AUTH_CORE_ISSUER", ISSUER.to_owned()),
-    ]);
+    ];
+    if let Some(methods) = methods {
+        pairs.push(("AUTH_CORE_LOGIN_METHODS", methods.to_owned()));
+    }
+    let config = MapConfig::from_pairs(pairs);
     TestHarness::with_ports(vec![Box::new(AuthCore::new())], |ports| {
         ports.config = Arc::new(config);
     })
+}
+
+async fn body_of(response: axum::response::Response) -> String {
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("body reads");
+    String::from_utf8_lossy(&bytes).to_string()
 }
 
 /// The S256 challenge for [`VERIFIER`], as a client computes it.
@@ -354,4 +370,155 @@ async fn logout_revokes_the_session_and_clears_the_cookie() {
         StatusCode::OK,
         "a revoked session falls back to the chooser rather than minting a code"
     );
+}
+
+// ---------------------------------------------------------------------
+// The login chooser (issue #33)
+// ---------------------------------------------------------------------
+
+/// The acceptance criterion: with a method configured, the chooser
+/// offers it and the round trip returns to the pending `/authorize`.
+#[pollster::test]
+async fn the_chooser_offers_configured_methods_and_returns_to_the_pending_authorize() {
+    let kit = kit_with_methods(Some("google,apple"));
+    seed_client(&kit).await;
+
+    // No cookie: this is the chooser, not a code.
+    let response = get(&kit, &authorize_uri(""), None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page = body_of(response).await;
+
+    assert!(page.contains("Continue with Google"), "{page}");
+    assert!(page.contains("Continue with Apple"), "{page}");
+    assert!(
+        !page.contains("No login methods are enabled"),
+        "the empty state rendered with two methods configured"
+    );
+
+    // Each button carries the pending /authorize as `return_to`, encoded,
+    // so the provider's own `?` and `&` cannot be read as its parameters.
+    assert!(
+        page.contains("/v1/auth-oidc/google/start?return_to=%2Fv1%2Fauth-core%2Fauthorize%3F"),
+        "the Google button does not carry an encoded return_to: {page}"
+    );
+    // The client id and the code challenge must survive into it, or the
+    // person comes back to a request that no longer means anything.
+    assert!(page.contains("client_id%3D"), "{page}");
+    assert!(page.contains("code_challenge%3D"), "{page}");
+}
+
+/// The other acceptance criterion: nothing configured still renders the
+/// empty state rather than an empty list or a crash.
+#[pollster::test]
+async fn with_nothing_configured_the_empty_state_still_renders() {
+    let kit = kit();
+    seed_client(&kit).await;
+    let response = get(&kit, &authorize_uri(""), None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page = body_of(response).await;
+    assert!(page.contains("No login methods are enabled"), "{page}");
+    assert!(
+        !page.contains("<script"),
+        "no methods should mean no script"
+    );
+}
+
+/// A passkey cannot be a link: the ceremony is script on this origin.
+/// The script ships only when a passkey is offered.
+#[pollster::test]
+async fn a_passkey_gets_a_scripted_button_and_a_redirect_method_does_not() {
+    let kit = kit_with_methods(Some("passkey,google"));
+    seed_client(&kit).await;
+    let page = body_of(get(&kit, &authorize_uri(""), None).await).await;
+
+    assert!(
+        page.contains("<script"),
+        "the passkey button needs its script"
+    );
+    assert!(page.contains("navigator.credentials"), "{page}");
+    assert!(
+        page.contains("data-method=\"passkey\""),
+        "the passkey button is missing: {page}"
+    );
+    // Google stays a plain link, so it works with script switched off.
+    assert!(
+        page.contains("data-method=\"google\"") && page.contains("/v1/auth-oidc/google/start"),
+        "{page}"
+    );
+
+    // Google-only ships no script at all.
+    let kit = kit_with_methods(Some("google"));
+    seed_client(&kit).await;
+    let page = body_of(get(&kit, &authorize_uri(""), None).await).await;
+    assert!(
+        !page.contains("<script"),
+        "a link-only chooser needs no script"
+    );
+}
+
+/// The request target cannot carry a raw `<`: `http::Uri` refuses one, so
+/// a hostile `state` arrives percent-encoded and reaches the page as data.
+/// The escaping itself is proved directly in the unit test on the template,
+/// because this path cannot express the attack.
+#[pollster::test]
+async fn a_hostile_state_parameter_arrives_encoded_and_stays_data() {
+    let kit = kit_with_methods(Some("passkey"));
+    seed_client(&kit).await;
+    let uri = format!(
+        "/v1/auth-core/authorize?response_type=code&client_id={CLIENT}\
+         &redirect_uri={REDIRECT}&code_challenge={}&code_challenge_method=S256\
+         &state=%3C%2Fscript%3E%3Cscript%3Ealert(1)%3C%2Fscript%3E",
+        challenge()
+    );
+    let page = body_of(get(&kit, &uri, None).await).await;
+
+    // It must be the chooser that rendered, or this asserts nothing.
+    assert!(
+        page.contains("data-method=\"passkey\""),
+        "not the chooser: {page}"
+    );
+    assert!(
+        page.contains("%3C%2Fscript%3E"),
+        "the hostile state never reached the page, so this proves nothing: {page}"
+    );
+    assert!(!page.contains("alert(1)</script>"), "{page}");
+}
+
+/// A slug the chooser does not know is a build failure, not a button
+/// that 404s.
+#[test]
+fn an_unknown_login_method_slug_is_refused_at_build() {
+    use factory0_core::{Config, MapConfig, Module};
+    let cfg = MapConfig::from_pairs([
+        (
+            "AUTH_CORE_SIGNING_KEYS",
+            serde_json::to_string(&vec![dummy_key("k1")]).expect("keys json"),
+        ),
+        ("AUTH_CORE_SIGNING_KEY_ACTIVE", "k1".to_owned()),
+        ("AUTH_CORE_ISSUER", ISSUER.to_owned()),
+        (
+            "AUTH_CORE_LOGIN_METHODS",
+            "google,carrier-pigeon".to_owned(),
+        ),
+    ]);
+    let errors = AuthCore::new()
+        .validate_config(&cfg as &dyn Config)
+        .expect_err("an unknown slug is refused");
+    let rendered = format!("{errors:?}");
+    assert!(rendered.contains("carrier-pigeon"), "{rendered}");
+    assert!(
+        rendered.contains("passkey"),
+        "the message lists what it knows: {rendered}"
+    );
+}
+
+/// Not an assertion: writes the rendered chooser to `/tmp` so it can be
+/// opened in a browser. Ignored by default.
+#[pollster::test]
+#[ignore = "manual: writes /tmp/cf-chooser.html for eyeballing"]
+async fn dump_the_chooser() {
+    let kit = kit_with_methods(Some("passkey,google,apple"));
+    seed_client(&kit).await;
+    let page = body_of(get(&kit, &authorize_uri(""), None).await).await;
+    std::fs::write("/tmp/cf-chooser.html", page).expect("writes");
 }

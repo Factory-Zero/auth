@@ -57,6 +57,26 @@ validated before the issues were written, and what is deferred.
 | `auth-password` | argon2id registration and login, breach check |
 | `auth-magic-link` | request and single-use consume |
 
+## The login chooser
+
+`/v1/auth-core/authorize` renders a sign-in page whenever there is no session.
+Which buttons it offers is configuration, not discovery:
+
+```
+AUTH_CORE_LOGIN_METHODS=passkey,google,apple
+```
+
+Order is display order, and an unknown slug fails `validate_config` rather than
+rendering a button that 404s. Setting a provider's credentials does **not** by
+itself put it on the chooser: which methods a deployment offers is a decision.
+
+Redirect-shaped methods are plain links and work with script switched off. A
+passkey cannot be: a WebAuthn credential is bound to a relying-party id, and a
+browser only runs a ceremony on a page whose origin matches, so a passkey
+registered here works on this service's own pages and nowhere else. That is why
+the chooser ships one small inline script, and why it ships it only when a
+passkey is enabled. See [ADR 0103](docs/adr/0103-the-login-chooser-and-browser-side-methods.md).
+
 ## Status
 
 Design adopted 2026-09-06. Three spikes come first; everything else is
