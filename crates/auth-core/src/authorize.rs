@@ -14,8 +14,12 @@
 //!    `error` parameters — spec-recommended, and safe because the URI
 //!    is by then exact-matched against the registration.
 //! 2. **No session, no code** — `/authorize` without a live session
-//!    renders the login chooser; each login method's own issue
-//!    (issues #13-#22) adds its button and returns here.
+//!    renders the login chooser, which offers the methods
+//!    `AUTH_CORE_LOGIN_METHODS` names and carries this request as
+//!    `return_to` so a person comes back to it (issue #33, ADR 0103).
+//!    Redirect-shaped methods are links; a passkey is a scripted button,
+//!    because a WebAuthn ceremony only runs on the origin its credential
+//!    is bound to and so cannot happen anywhere but here.
 //!
 //! Authorization codes are 32 random bytes, base64url, stored only as
 //! their SHA-256 in a `single_use_tokens` row of kind
@@ -24,12 +28,12 @@
 
 use askama::Template;
 use axum::extract::rejection::QueryRejection;
-use axum::extract::{Query, State};
+use axum::extract::{OriginalUri, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use base64ct::{Base64UrlUnpadded, Encoding};
-use factory0_core::{Database, Problem, Scope, subject_hash};
+use factory0_core::{Config, Database, ModuleConfig, Problem, Scope, subject_hash};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -52,16 +56,82 @@ pub const CODE_LIFETIME_SECS: i64 = 60;
 const AUTHORIZE_REFUSED_MESSAGE: &str =
     "The sign-in request did not match a registered application.";
 
-/// A button on the login chooser. Empty until the login-method issues
-/// land; the template carries the empty-state copy.
+/// Where the chooser sends somebody when the request has no path at all,
+/// which a well-formed HTTP request cannot produce.
+const DEFAULT_CHOOSER_RETURN_TO: &str = "/";
+
+/// The config key naming which login methods this deployment offers.
+///
+/// Explicit rather than sniffed from the other modules' keys. auth-core
+/// does not import the login-method crates and must not learn their
+/// configuration either, and a method whose module is not mounted would
+/// otherwise get a button that 404s. Unknown slugs fail `validate_config`.
+pub const LOGIN_METHODS_KEY: &str = "LOGIN_METHODS";
+
+/// How a method is started from the chooser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MethodKind {
+    /// A plain link: the browser is redirected and comes back.
+    Redirect,
+    /// A WebAuthn ceremony, which is script on this origin and nowhere
+    /// else. See [`enabled_login_methods`].
+    Passkey,
+}
+
+/// Every method the chooser knows how to start, by slug.
+///
+/// Adding a redirect-shaped provider is a row here. The label and the
+/// path are auth-core's, because the chooser is auth-core's page.
+///
+/// A row is **data, not a dependency**: auth-core links none of the
+/// login-method crates, so a slug can be listed before its module exists
+/// and offering it is still `AUTH_CORE_LOGIN_METHODS`'s decision. That is
+/// what lets a provider be added here and implemented separately.
+const CATALOGUE: &[(&str, &str, &str, MethodKind)] = &[
+    (
+        "passkey",
+        "Continue with a passkey",
+        "",
+        MethodKind::Passkey,
+    ),
+    (
+        "google",
+        "Continue with Google",
+        "/v1/auth-oidc/google/start",
+        MethodKind::Redirect,
+    ),
+    (
+        "apple",
+        "Continue with Apple",
+        "/v1/auth-oidc/apple/start",
+        MethodKind::Redirect,
+    ),
+    (
+        "meta",
+        "Continue with Facebook",
+        "/v1/auth-meta/start",
+        MethodKind::Redirect,
+    ),
+];
+
+/// The slugs `AUTH_CORE_LOGIN_METHODS` accepts.
+#[must_use]
+pub fn known_method_slugs() -> Vec<&'static str> {
+    CATALOGUE.iter().map(|(slug, ..)| *slug).collect()
+}
+
+/// A button on the login chooser.
 pub struct LoginMethod {
-    /// The method's identifier, e.g. `passkey`. Unused until a login
-    /// method registers a button (#13-#21); kept so the chooser's shape
-    /// does not change when they land.
-    #[allow(dead_code)]
+    /// The method's identifier, e.g. `passkey`.
     pub slug: String,
     pub label: String,
+    /// Where the button goes. Empty for a passkey, which is started by
+    /// script rather than followed.
     pub href: String,
+    /// Whether the template renders this as the scripted passkey button
+    /// rather than a link. A field rather than a match in the template,
+    /// because askama templates should not carry logic.
+    pub is_passkey: bool,
 }
 
 /// Renders an askama template to an HTML response.
@@ -85,6 +155,11 @@ fn html(template: &impl Template) -> Response {
 #[template(path = "login_chooser.html")]
 struct LoginChooserTemplate {
     methods: Vec<LoginMethod>,
+    /// Whether to emit the passkey script at all. A page that offers no
+    /// passkey carries no script.
+    has_passkey: bool,
+    /// The pending `/authorize`, for the button to navigate back to.
+    return_to: String,
 }
 
 #[derive(Template)]
@@ -109,12 +184,49 @@ fn sha256(bytes: &[u8]) -> Vec<u8> {
     Sha256::digest(bytes).to_vec()
 }
 
-/// The enabled login methods, in display order. Login methods are
-/// issues #13-#22; none exists yet, so the chooser renders its
-/// empty state until the first one lands and appends its button.
+/// The methods this deployment offers, in the order the operator listed
+/// them, each carrying `return_to` so a person lands back on the
+/// `/authorize` they started from.
+///
+/// **Why passkeys cannot be a link.** A WebAuthn credential is bound to a
+/// relying-party id, and a browser will only run a ceremony for an RP id
+/// that matches the page it is on. A passkey registered here can therefore
+/// only ever be used on a page served by this service: a consuming app on
+/// its own domain is physically unable to run the ceremony, whatever code
+/// it ships. So either this service renders a page with script, or passkeys
+/// are unreachable through the authorization flow. It renders the page
+/// (ADR 0103); redirect-shaped methods stay plain links, which work with
+/// script switched off.
 #[must_use]
-pub fn enabled_login_methods() -> Vec<LoginMethod> {
-    Vec::new()
+pub fn enabled_login_methods(cfg: &dyn Config, return_to: &str) -> Vec<LoginMethod> {
+    let module = ModuleConfig::new("auth-core", cfg);
+    let Some(raw) = module.get_opt(LOGIN_METHODS_KEY) else {
+        return Vec::new();
+    };
+    // The same encoder the OAuth error redirect uses. What goes in is a
+    // path carrying a query of its own, so every `&`, `=` and `?` must
+    // survive as data or the provider's `/start` reads the tail as its
+    // own parameters.
+    let encoded = encode_query_component(return_to);
+    raw.split(',')
+        .map(str::trim)
+        .filter(|slug| !slug.is_empty())
+        .filter_map(|slug| {
+            CATALOGUE
+                .iter()
+                .find(|(known, ..)| *known == slug)
+                .map(|(slug, label, path, kind)| LoginMethod {
+                    slug: (*slug).to_owned(),
+                    label: (*label).to_owned(),
+                    href: match kind {
+                        MethodKind::Redirect => format!("{path}?return_to={encoded}"),
+                        // Started by script, not followed.
+                        MethodKind::Passkey => String::new(),
+                    },
+                    is_passkey: *kind == MethodKind::Passkey,
+                })
+        })
+        .collect()
 }
 
 fn error_page(scope: &Scope) -> Response {
@@ -224,6 +336,7 @@ async fn validate_client_and_uri(
 async fn authorize(
     scope: Scope,
     State(state): State<Arc<ModuleState>>,
+    OriginalUri(original_uri): OriginalUri,
     headers: HeaderMap,
     query: Result<Query<AuthorizeQuery>, QueryRejection>,
 ) -> Result<Response, Problem> {
@@ -279,19 +392,44 @@ async fn authorize(
     }
 
     // A session is required to mint a code; without one, the login
-    // chooser (its buttons arrive with the login-method issues).
+    // chooser. Its buttons carry this very request as `return_to`, so a
+    // person lands back on the pending `/authorize` rather than on the
+    // service's root with their request lost.
+    //
+    // `OriginalUri` and not `Uri`: the module is nested under
+    // `/v1/auth-core`, and a nested handler sees the URI with the prefix
+    // already stripped, so `Uri` alone would send people to `/authorize`,
+    // which does not exist.
+    let chooser = || {
+        // Path and query, never `to_string()`. On Workers the runtime
+        // builds the request from `req.url()`, so the URI is **absolute**:
+        // `https://auth.example/v1/auth-core/authorize?...`. Every
+        // provider's `safe_return_to` refuses anything not starting with
+        // `/`, so an absolute value is silently replaced by the default
+        // and the person lands on `/` with their authorization request
+        // gone — which is the exact thing this page exists to prevent.
+        // On the native runtime the same URI arrives in origin form, so
+        // the bug only appears in production, which is why the tests were
+        // green. See the test that sends an absolute-form target.
+        let return_to = original_uri.path_and_query().map_or_else(
+            || DEFAULT_CHOOSER_RETURN_TO.to_owned(),
+            |path_and_query| path_and_query.as_str().to_owned(),
+        );
+        let methods = enabled_login_methods(&*state.ctx.config, &return_to);
+        html(&LoginChooserTemplate {
+            has_passkey: methods.iter().any(|method| method.is_passkey),
+            methods,
+            return_to,
+        })
+    };
     let Some(cookie) = sessions::cookie_value(&headers) else {
-        return Ok(html(&LoginChooserTemplate {
-            methods: enabled_login_methods(),
-        }));
+        return Ok(chooser());
     };
     let session = sessions::validate(&*db, &*clock, &cookie)
         .await
         .map_err(|_| Problem::internal())?;
     let Some(session) = session else {
-        return Ok(html(&LoginChooserTemplate {
-            methods: enabled_login_methods(),
-        }));
+        return Ok(chooser());
     };
 
     let mut bytes = [0u8; 32];
@@ -408,6 +546,43 @@ pub(crate) fn router() -> axum::Router<Arc<ModuleState>> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The template must escape `return_to`, whatever it holds.
+    ///
+    /// The HTTP path cannot deliver a raw `<` — `http::Uri` refuses one —
+    /// so this renders the template directly with a value no request could
+    /// carry. That is the point: the escaping is the defence, and it must
+    /// hold without depending on the URI parser to be the thing that saves
+    /// us. If `return_to` ever moves into the script body, this fails.
+    #[test]
+    fn a_hostile_return_to_cannot_break_out_of_the_page() {
+        let hostile = "/authorize?state=</script><script>alert(1)</script>";
+        let page = LoginChooserTemplate {
+            methods: vec![LoginMethod {
+                slug: "passkey".to_owned(),
+                label: "Continue with a passkey".to_owned(),
+                href: String::new(),
+                is_passkey: true,
+            }],
+            has_passkey: true,
+            return_to: hostile.to_owned(),
+        }
+        .render()
+        .expect("renders");
+
+        assert!(
+            !page.contains("</script><script>alert(1)"),
+            "return_to escaped into the page: {page}"
+        );
+        // askama escapes with numeric entities (`&#60;`), not named ones.
+        // Asserted on the escaped form rather than the absence of the raw
+        // one, so this fails loudly if the value ever stops being escaped
+        // rather than quietly if it stops being present.
+        assert!(
+            page.contains("&#60;/script&#62;") || page.contains("&lt;/script&gt;"),
+            "the value should be present and escaped: {page}"
+        );
+    }
     use super::*;
 
     #[test]

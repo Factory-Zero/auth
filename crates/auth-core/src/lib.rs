@@ -234,6 +234,27 @@ impl Module for AuthCore {
             ));
             return Err(errors);
         }
+        // A slug the chooser does not know would render a button that
+        // 404s, and the operator would have no way to tell that from a
+        // method that is simply switched off.
+        if let Some(raw) = cfg.get(&module.key(authorize::LOGIN_METHODS_KEY)) {
+            let known = authorize::known_method_slugs();
+            let unknown: Vec<&str> = raw
+                .split(',')
+                .map(str::trim)
+                .filter(|slug| !slug.is_empty() && !known.contains(slug))
+                .collect();
+            if !unknown.is_empty() {
+                let mut errors = ConfigError::default();
+                errors.push(format!(
+                    "auth-core: {} does not know {:?}; it offers {}",
+                    module.key(authorize::LOGIN_METHODS_KEY),
+                    unknown.join(", "),
+                    known.join(", ")
+                ));
+                return Err(errors);
+            }
+        }
         match tokens::SigningKeys::from_config(cfg) {
             Ok(_) => Ok(()),
             Err(err) => {
