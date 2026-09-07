@@ -192,3 +192,91 @@ fn a_google_account_with_no_email_still_signs_in() {
         assert_eq!(count(&kit, "identities"), 1);
     });
 }
+
+/// Issue #37: the kill switch has to stop the writes, not only the session.
+///
+/// `issue` refused a disabled account from the start, so no session was
+/// ever handed out. But the outcome was carried out first, so every
+/// attempt still recorded a login on the identity or inserted a new one,
+/// and a disabled account accrued rows and events indefinitely.
+#[test]
+fn a_disabled_account_gains_nothing_from_a_provider_sign_in() {
+    pollster::block_on(async {
+        let kit = kit();
+
+        // Two sign-ins while the account is fine. Two, because the first
+        // is a `NewUser` outcome and only a `Known` one records a login.
+        for _ in 0..2 {
+            let started = start(&kit, "").await;
+            let response = callback(&kit, &started, "auth-code", &started.state).await;
+            assert_eq!(response.status, StatusCode::FOUND, "{}", response.text());
+            kit.clock.advance_secs(60);
+        }
+        assert_eq!(count(&kit, "identities"), 1);
+
+        let before = support::column(
+            &kit,
+            "SELECT last_login_at FROM identities",
+            "last_login_at",
+        );
+        assert!(before.is_some(), "a repeat login should be recorded");
+
+        pollster::block_on(kit.db.execute(&factory0_core::Statement::new(
+            "UPDATE users SET status = 'disabled'",
+        )))
+        .expect("status updates");
+        // Enough for a new `last_login_at` to be visibly different, and not
+        // so much that the fake's ID token expires: past that, the callback
+        // fails at token verification and never reaches the linking rules,
+        // which would make this test pass for the wrong reason.
+        kit.clock.advance_secs(60);
+
+        // A third attempt: refused, and it writes nothing.
+        let started = start(&kit, "").await;
+        let response = callback(&kit, &started, "auth-code", &started.state).await;
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
+        assert!(
+            response.cookie("__Host-fz_session").is_none(),
+            "issued a session"
+        );
+        assert_eq!(
+            support::column(
+                &kit,
+                "SELECT last_login_at FROM identities",
+                "last_login_at"
+            ),
+            before,
+            "a disabled account still recorded a login"
+        );
+        assert_eq!(count(&kit, "identities"), 1);
+    });
+}
+
+/// The same switch on the path that would otherwise *add* a provider: a
+/// verified-address match onto a disabled account must not write the
+/// identity row either.
+#[test]
+fn a_disabled_account_gains_no_identity_from_an_auto_link() {
+    pollster::block_on(async {
+        let kit = kit();
+        let existing = seed_user(&kit, "nick@example.com", true).await;
+        pollster::block_on(kit.db.execute(&factory0_core::Statement::new(
+            "UPDATE users SET status = 'disabled'",
+        )))
+        .expect("status updates");
+
+        let started = start(&kit, "").await;
+        let response = callback(&kit, &started, "auth-code", &started.state).await;
+
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
+        assert!(response.cookie("__Host-fz_session").is_none());
+        assert_eq!(
+            count(&kit, "identities"),
+            0,
+            "a disabled account gained a way in"
+        );
+        // And the account itself is untouched.
+        assert_eq!(count(&kit, "users"), 1);
+        let _ = existing;
+    });
+}

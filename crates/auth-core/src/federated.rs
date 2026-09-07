@@ -21,7 +21,9 @@ use factory0_core::{Clock, Database, IdGen};
 
 use crate::linking::{IncomingIdentity, Outcome, create_user, link, resolve};
 use crate::sessions::{IssuedSession, Login, SessionError, issue};
-use crate::store::{delete_user, identity_by_provider_subject, touch_identity_login};
+use crate::store::{
+    STATUS_ACTIVE, delete_user, identity_by_provider_subject, touch_identity_login, user_by_id,
+};
 
 /// What a provider told us about the person, already normalized.
 #[derive(Debug, Clone)]
@@ -139,6 +141,8 @@ pub async fn complete(
         .await
         .map_err(|err| CompleteError::Internal(format!("linking could not be resolved: {err}")))?;
 
+    refuse_unless_active(db, &outcome, identity.provider).await?;
+
     let mut auto_linked_notify = None;
     let user_id = match outcome {
         Outcome::Known { user_id } => {
@@ -222,6 +226,55 @@ pub async fn complete(
 
 fn iso(clock: &dyn Clock) -> String {
     crate::sessions::iso(clock.now())
+}
+
+/// The kill switch, checked **before** an outcome is carried out (#37).
+///
+/// `issue` refuses a disabled account, so no session was ever handed out.
+/// But every branch of `complete` writes first: `Known` records a login
+/// timestamp, `AutoLinked` inserts an identity row and the caller
+/// announces it. So a disabled account still accrued rows and events on
+/// every attempt, and the switch stopped short of the thing it is for.
+///
+/// `NewUser` cannot name an existing account, so there is nothing to
+/// check; the others all resolve to a user id that already exists.
+async fn refuse_unless_active(
+    db: &dyn Database,
+    outcome: &Outcome,
+    provider: &str,
+) -> Result<(), CompleteError> {
+    let Some(user_id) = existing_user_of(outcome) else {
+        return Ok(());
+    };
+    match user_by_id(db, user_id).await {
+        Ok(Some(user)) if user.status == STATUS_ACTIVE => Ok(()),
+        Ok(_) => {
+            tracing::warn!(
+                user = %user_id,
+                provider,
+                "a provider sign-in was refused for an account that is not active"
+            );
+            // No auto-link to report: nothing has been written.
+            Err(CompleteError::NotActive(None))
+        }
+        Err(err) => Err(CompleteError::Internal(format!(
+            "could not read the account: {err}"
+        ))),
+    }
+}
+
+/// The existing account an outcome names, when it names one.
+///
+/// `NewUser` names none by definition. The rest all resolve to an account
+/// that already exists, which is what makes the status check above
+/// possible before anything is written.
+fn existing_user_of(outcome: &Outcome) -> Option<&str> {
+    match outcome {
+        Outcome::Known { user_id }
+        | Outcome::AutoLinked { user_id, .. }
+        | Outcome::ConfirmLink { user_id } => Some(user_id),
+        Outcome::NewUser | Outcome::ExistingAccountUnverified => None,
+    }
 }
 
 /// Creates the account a first sign-in earns, and links the identity to it.
