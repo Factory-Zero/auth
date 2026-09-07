@@ -63,7 +63,7 @@ validated before the issues were written, and what is deferred.
 Which buttons it offers is configuration, not discovery:
 
 ```
-AUTH_CORE_LOGIN_METHODS=passkey,google,apple
+AUTH_CORE_LOGIN_METHODS=passkey,google,apple,meta
 ```
 
 Order is display order, and an unknown slug fails `validate_config` rather than

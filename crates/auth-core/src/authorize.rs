@@ -78,6 +78,11 @@ pub enum MethodKind {
 ///
 /// Adding a redirect-shaped provider is a row here. The label and the
 /// path are auth-core's, because the chooser is auth-core's page.
+///
+/// A row is **data, not a dependency**: auth-core links none of the
+/// login-method crates, so a slug can be listed before its module exists
+/// and offering it is still `AUTH_CORE_LOGIN_METHODS`'s decision. That is
+/// what lets a provider be added here and implemented separately.
 const CATALOGUE: &[(&str, &str, &str, MethodKind)] = &[
     (
         "passkey",
@@ -95,6 +100,12 @@ const CATALOGUE: &[(&str, &str, &str, MethodKind)] = &[
         "apple",
         "Continue with Apple",
         "/v1/auth-oidc/apple/start",
+        MethodKind::Redirect,
+    ),
+    (
+        "meta",
+        "Continue with Facebook",
+        "/v1/auth-meta/start",
         MethodKind::Redirect,
     ),
 ];

@@ -484,6 +484,30 @@ async fn a_hostile_state_parameter_arrives_encoded_and_stays_data() {
     assert!(!page.contains("alert(1)</script>"), "{page}");
 }
 
+/// A catalogue row is data, not a dependency: auth-core links none of the
+/// login-method crates, so a provider can be listed here and implemented
+/// separately. This kit mounts auth-core alone and still offers all four.
+#[pollster::test]
+async fn the_catalogue_needs_none_of_the_method_crates_mounted() {
+    let kit = kit_with_methods(Some("passkey,google,apple,meta"));
+    seed_client(&kit).await;
+    let page = body_of(get(&kit, &authorize_uri(""), None).await).await;
+
+    for (slug, path) in [
+        ("google", "/v1/auth-oidc/google/start"),
+        ("apple", "/v1/auth-oidc/apple/start"),
+        ("meta", "/v1/auth-meta/start"),
+    ] {
+        assert!(
+            page.contains(&format!("data-method=\"{slug}\"")),
+            "{slug}: {page}"
+        );
+        assert!(page.contains(path), "{slug} has the wrong path: {page}");
+    }
+    assert!(page.contains("Continue with Facebook"), "{page}");
+    assert!(page.contains("data-method=\"passkey\""), "{page}");
+}
+
 /// A slug the chooser does not know is a build failure, not a button
 /// that 404s.
 #[test]

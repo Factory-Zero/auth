@@ -87,8 +87,13 @@ defence should not rest on a property of the URI parser.
 
 ## Consequences
 
-- The chooser works: with `passkey,google,apple` configured it offers three
-  buttons and returns to the pending `/authorize`.
+- The chooser works: with `passkey,google,apple,meta` configured it offers
+  four buttons and returns to the pending `/authorize`.
+- A catalogue row is **data, not a dependency**. auth-core links none of the
+  login-method crates, so a slug can be listed before its module is built,
+  and whether it is offered stays `AUTH_CORE_LOGIN_METHODS`'s decision. That
+  is what lets a provider be added to the chooser and implemented in a
+  separate change.
 - With nothing configured the existing empty state still renders, and ships
   no script.
 - Adding a redirect-shaped provider is one row in the catalogue.
