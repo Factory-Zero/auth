@@ -64,9 +64,12 @@ Apple's ceiling at build time rather than in a test, because a secret past
 it fails at Apple on every sign-in and in no test that does not call Apple.
 
 The minted secret is cached in memory until five minutes before it expires,
-keyed by the client id it was minted for: configuration can change under a
-live isolate, and a secret whose `sub` names the old Services ID is refused
-by Apple in a way that looks like a key problem.
+keyed by the client id **and the key id** it was minted for: configuration
+can change under a live isolate, and a secret whose `sub` names the old
+Services ID, or that was signed by a key since revoked, is refused by Apple
+in a way that looks like a key problem rather than a stale-cache one. The
+key id is the one that matters, because the rotation below leaves the client
+id alone.
 
 **Rotation is a secret swap.** Replace `AUTH_OIDC_APPLE_PRIVATE_KEY` and
 `AUTH_OIDC_APPLE_KEY_ID` together and redeploy. There is no stored secret
@@ -91,7 +94,18 @@ on its own: it is signed so it cannot be forged, `__Host-` keeps it
 origin-locked, it lives ten minutes, and the only thing a holder can do
 with it is finish the flow it belongs to, which also needs Apple's own code
 and a `state` that matches. The `state` comparison is what defends the
-callback, and it happens before anything else, on the error path too.
+callback, and it happens before anything is spent, cleared or persisted.
+
+**And nothing is cleared before it.** A review caught the opposite: the
+unparseable-body and missing-`state` paths both cleared the flow cookie
+before comparing. On a `SameSite=None` cookie that is a real capability a
+redirect provider never handed anyone — any page the victim has open can
+`fetch(..., {credentials: 'include'})` at the callback, the browser
+attaches the cookie, and the reply clears it, so Apple's real response
+seconds later reads as an expired flow. It is a denial of one sign-in
+attempt rather than a bypass, and Safari and Firefox partition third-party
+cookies so it is Chrome-shaped, but it was ours to give away and we were
+giving it. The cookie is now spent only once the state has matched.
 
 ### 3. The name is taken from the form body, once
 
@@ -115,7 +129,29 @@ is the same class of trap as the HS256 one fixed in #15, where a discovery
 document listing HS256 would have turned our own client secret into the
 signing key.
 
-### 5. Private relay addresses were already handled
+### 5. The signed-in user is carried in the flow, not in a cookie
+
+The session cookie is `SameSite=Lax`, so by this ADR's own reasoning it does
+**not** arrive on Apple's cross-site POST either. Left alone, a signed-in
+person adding Apple looks like a stranger to the linking rules: `ConfirmLink`
+can never fire, and a relay address or an address that is not theirs
+silently creates a **second account** and switches the browser into it.
+
+`/start` is same-site, a top-level navigation from our own page, so the
+session cookie does arrive there. The signed-in user id is validated there
+and sealed into the signed flow, and the callback uses it when no live
+cookie arrives, re-checking that the account still exists and is active
+because it may have been disabled in the ten minutes since.
+
+What is not carried is the session cookie's own value, so the fixation
+revoke in `sessions::issue` does not fire on this path: the person's
+previous session row stays live server-side until it expires, with no
+cookie pointing at it, because the browser has just overwritten it. That is
+untidy rather than exploitable — the cookie is `__Host-` and `HttpOnly`, so
+it cannot be planted cross-site, which is the attack the revoke exists for.
+Filed rather than bodged.
+
+### 6. Private relay addresses were already handled
 
 Apple may return a `@privaterelay.appleid.com` address. It is a per-app
 alias, so two different people can hold relay addresses that look equally
@@ -131,7 +167,19 @@ real Apple flow rather than through the rules in isolation.
   route method.
 - A half-configured Apple block fails `validate_config`, naming the missing
   keys, so `fz doctor` and `Harness::build` refuse it rather than answering
-  requests that will fail at Apple later.
+  requests that will fail at Apple later. **A key that parses to nothing
+  fails it too**: presence is not usability, and the key is otherwise first
+  parsed at request time, so a corrupt `.p8` would pass the check and then
+  503 every Apple request.
+- `openidconnect` is built with `accept-string-booleans`. Apple documents
+  `email_verified` as "a String or Boolean" and sends `"true"`; without the
+  feature every real Apple sign-in fails ID-token verification with an
+  "invalid type: string" that no fake reproduces unless it is told to. The
+  test provider now sends the string, so the suite covers it.
+- The secret cache is keyed on the client id **and the key id**. The
+  documented rotation swaps the `.p8` and the key id together and leaves the
+  client id alone, so keying on the client id by itself would keep signing
+  with the revoked key for the rest of the window.
 - `p256` gains the `pkcs8` and `pem` features. Both are pure Rust and the
   workspace still builds to `wasm32` with no `openssl`, `reqwest` or `mio`
   in the tree.

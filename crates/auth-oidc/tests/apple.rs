@@ -347,6 +347,124 @@ fn a_body_that_will_not_parse_answers_like_an_expired_flow() {
 }
 
 #[test]
+fn a_stranger_cannot_clear_a_victims_flow_cookie() {
+    // The one thing `SameSite=None` newly hands an attacker. Any page the
+    // victim has open can `fetch(..., {credentials: 'include'})` at this
+    // route, and the browser attaches the flow cookie. If an unverified
+    // request could clear it, a stranger could abort a sign-in in progress
+    // from anywhere. Nothing is cleared until the state matches.
+    pollster::block_on(async {
+        let kit = apple_kit();
+        let started = start_at(&kit, APPLE_START, "").await;
+
+        for hostile in ["code=x", "", "%%%", "code=x&state=not-the-state"] {
+            let response = post_form_with(
+                &kit,
+                APPLE_CALLBACK,
+                hostile,
+                &[("__Host-fz_oidc", &started.flow_cookie)],
+            )
+            .await;
+            let cleared = response.cookies().into_iter().any(|header| {
+                header.starts_with("__Host-fz_oidc=") && header.contains("Max-Age=0")
+            });
+            assert!(
+                !cleared,
+                "{hostile:?} cleared a flow cookie it never proved it owned"
+            );
+        }
+
+        // And the real callback still works afterwards: the victim's flow
+        // survived every one of those.
+        kit.provider.set_claims(TokenClaims::apple());
+        let response = post_form_with(
+            &kit,
+            APPLE_CALLBACK,
+            &body("apple-code", &started.state),
+            &[("__Host-fz_oidc", &started.flow_cookie)],
+        )
+        .await;
+        assert_eq!(
+            response.status,
+            StatusCode::FOUND,
+            "the victim's sign-in was aborted: {}",
+            response.text()
+        );
+    });
+}
+
+#[test]
+fn signing_in_while_signed_in_adds_a_provider_rather_than_a_second_account() {
+    // The session cookie is `SameSite=Lax`, so it does NOT arrive on
+    // Apple's cross-site POST. Without carrying the answer from `/start`,
+    // a signed-in person adding Apple looks like a stranger: they get a
+    // second account and the browser is switched into it.
+    pollster::block_on(async {
+        let kit = apple_kit();
+        let existing = seed_user(&kit, "someone@example.com").await;
+        let session = factory0_auth_core::issue(
+            &*kit.db,
+            &*kit.clock,
+            &*kit.id_gen,
+            factory0_auth_core::Login {
+                user_id: &existing,
+                ip: None,
+                user_agent: None,
+                presented_cookie: None,
+                amr: &["password"],
+            },
+        )
+        .await
+        .expect("a session issues");
+
+        // `/start` is same-site, so the session cookie arrives there.
+        let started = {
+            let response = get(&kit, APPLE_START, &[("__Host-fz_session", &session.value)]).await;
+            assert_eq!(response.status, StatusCode::FOUND);
+            let url = response.location().expect("a Location");
+            let parsed = url::Url::parse(&url).expect("a url");
+            let state = parsed
+                .query_pairs()
+                .find(|(key, _)| key == "state")
+                .map(|(_, value)| value.to_string())
+                .expect("a state");
+            let nonce = parsed
+                .query_pairs()
+                .find(|(key, _)| key == "nonce")
+                .map(|(_, value)| value.to_string())
+                .expect("a nonce");
+            kit.provider.set_nonce(&nonce);
+            (
+                response.cookie("__Host-fz_oidc").expect("a flow cookie"),
+                state,
+            )
+        };
+
+        // Apple returns a relay address, which can never auto-link. The
+        // callback carries NO session cookie, because a cross-site POST
+        // does not.
+        let mut claims = TokenClaims::apple();
+        claims.email = Some("xyz@privaterelay.appleid.com".to_owned());
+        kit.provider.set_claims(claims);
+
+        let response = post_form_with(
+            &kit,
+            APPLE_CALLBACK,
+            &body("apple-code", &started.1),
+            &[("__Host-fz_oidc", &started.0)],
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK, "{}", response.text());
+
+        assert_eq!(
+            count(&kit, "users"),
+            1,
+            "adding Apple to an account made a second account"
+        );
+    });
+}
+
+#[test]
 fn a_relay_address_never_links_to_an_existing_account() {
     // Apple hands out a per-app alias. Two people can hold relay addresses
     // that look equally plausible, so one can never be evidence that this

@@ -246,6 +246,22 @@ fn resolve_settings(cfg: &dyn Config) -> Result<Settings, Vec<String>> {
                         module.key(&format!("{}_CLIENT_ID", provider.config))
                     ));
                 }
+                // Presence is not usability. The key is otherwise first
+                // parsed at request time, so a corrupt `.p8` passes
+                // `fz doctor` and then 503s every Apple request with
+                // nothing in the config check to say why.
+                if configured
+                    && missing.is_empty()
+                    && let Some(config) = apple_config(&module, provider)
+                    && apple::check_key(&config).is_err()
+                {
+                    problems.push(format!(
+                        "{} cannot mint with the configured {}: it is not a PKCS#8 P-256 \
+                         private key",
+                        provider.slug,
+                        module.key(&format!("{}_PRIVATE_KEY", provider.config))
+                    ));
+                }
                 if present("CLIENT_SECRET") {
                     problems.push(format!(
                         "{} does not take a {}: the secret is minted from the signing key, and \
@@ -562,6 +578,28 @@ mod tests {
         assert!(joined.contains("AUTH_OIDC_APPLE_KEY_ID"), "{joined}");
         assert!(joined.contains("AUTH_OIDC_APPLE_PRIVATE_KEY"), "{joined}");
         assert!(!joined.contains("AUTH_OIDC_APPLE_TEAM_ID"), "{joined}");
+    }
+
+    #[test]
+    fn a_private_key_that_cannot_sign_is_refused_at_build() {
+        // Presence is not usability. The key is otherwise first parsed at
+        // request time, so a corrupt `.p8` would pass `fz doctor` and then
+        // 503 every Apple request with nothing in the check to say why.
+        let cfg = apple_cfg(&[
+            ("AUTH_OIDC_APPLE_CLIENT_ID", "com.example.service"),
+            ("AUTH_OIDC_APPLE_TEAM_ID", "TEAM123456"),
+            ("AUTH_OIDC_APPLE_KEY_ID", "KEY7890123"),
+            (
+                "AUTH_OIDC_APPLE_PRIVATE_KEY",
+                "-----BEGIN PRIVATE KEY-----\nnope\n-----END PRIVATE KEY-----",
+            ),
+        ]);
+        let problems = resolve_settings(&cfg).expect_err("refused");
+        let joined = problems.join("; ");
+        assert!(joined.contains("cannot mint"), "{joined}");
+        assert!(joined.contains("AUTH_OIDC_APPLE_PRIVATE_KEY"), "{joined}");
+        // The message names the setting and never the bytes.
+        assert!(!joined.contains("nope"), "{joined}");
     }
 
     #[test]

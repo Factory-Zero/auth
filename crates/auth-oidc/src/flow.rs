@@ -41,6 +41,20 @@ pub(crate) struct Flow {
     pub return_to: String,
     /// Unix seconds. Checked against the `Clock` port.
     pub expires_at: i64,
+    /// The user who was signed in when `/start` ran, if anyone was.
+    ///
+    /// Carried here because a `form_post` callback is a cross-site POST and
+    /// the session cookie is `SameSite=Lax`, so it does **not** arrive on
+    /// one. Without this, a signed-in person adding Apple looks like a
+    /// stranger to the linking rules: `ConfirmLink` can never fire, and an
+    /// address that does not match theirs silently makes a second account
+    /// and switches the browser into it.
+    ///
+    /// `/start` is same-site (a top-level navigation from our own page), so
+    /// the session cookie does arrive there and is validated there. This
+    /// only carries the answer across, inside a payload we signed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_in_user: Option<String>,
 }
 
 impl Flow {
@@ -192,6 +206,7 @@ mod tests {
             verifier: "verifier-value".to_owned(),
             return_to: "/v1/auth-core/authorize?x=1".to_owned(),
             expires_at,
+            signed_in_user: None,
         }
     }
 

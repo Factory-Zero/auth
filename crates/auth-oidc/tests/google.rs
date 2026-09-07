@@ -367,6 +367,36 @@ fn an_unknown_provider_is_not_found() {
 }
 
 #[test]
+fn the_apple_only_user_field_is_ignored_on_a_redirect_callback() {
+    // `user` is Apple's one-time name field and the params struct is
+    // shared. Honouring it for every provider would let a redirect
+    // callback carry a name the provider never vouched for.
+    pollster::block_on(async {
+        let kit = kit();
+        kit.provider.set_claims(TokenClaims {
+            name: None,
+            ..TokenClaims::default()
+        });
+        let started = start(&kit, "").await;
+        let response = get(
+            &kit,
+            &format!(
+                "{CALLBACK}?code=auth-code&state={}&user=%7B%22name%22%3A%7B%22firstName%22%3A%22Mallory%22%7D%7D",
+                started.state
+            ),
+            &[("__Host-fz_oidc", &started.flow_cookie)],
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::FOUND, "{}", response.text());
+        assert_eq!(
+            support::column(&kit, "SELECT name_at_link FROM identities", "name_at_link"),
+            None,
+            "a redirect provider's callback accepted Apple's name field"
+        );
+    });
+}
+
+#[test]
 fn each_provider_answers_only_on_the_callback_method_it_uses() {
     // Apple posts and Google redirects. Serving both methods for both
     // would mean an authorization response could be delivered through a

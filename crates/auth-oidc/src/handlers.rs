@@ -229,6 +229,19 @@ async fn start(
     let (url, csrf, _nonce) = request.url();
     let csrf = csrf.secret().clone();
 
+    // Who is signed in *now*. `/start` is same-site, so the session cookie
+    // arrives here even for a provider whose callback will not carry it.
+    // Sealing the answer into the flow is what makes "add this provider to
+    // my account" work for a `form_post` provider at all.
+    let signed_in_user = match (ctx.ports.db.as_deref(), session_cookie_value(&headers)) {
+        (Some(db), Some(value)) => factory0_auth_core::validate(db, clock, &value)
+            .await
+            .ok()
+            .flatten()
+            .map(|session| session.user_id),
+        _ => None,
+    };
+
     let sealed = Flow {
         provider: provider.slug.to_owned(),
         state: csrf,
@@ -237,6 +250,7 @@ async fn start(
         return_to: safe_return_to(query.return_to.as_deref())
             .unwrap_or_else(|| settings.default_return_to.clone()),
         expires_at: clock.now().unix_timestamp() + flow::TTL_SECS,
+        signed_in_user,
     }
     .seal(signer);
 
@@ -293,8 +307,13 @@ async fn callback_form(
     // so the answer is identical to a missing `state`: a body that will
     // not parse is either a spoofed post or a provider change, and neither
     // is worth telling the sender apart.
+    // Deliberately does NOT clear the flow cookie. This route is a
+    // cross-site POST that carries a `SameSite=None` cookie, so anyone can
+    // make a victim's browser send one; clearing on an unverified request
+    // would let a stranger abort a sign-in in progress from any page the
+    // victim has open. Nothing is cleared until the state matches.
     let Ok(params) = serde_urlencoded::from_str::<CallbackParams>(&body) else {
-        return Ok(clear_flow(expired_page(), provider));
+        return Ok(expired_page());
     };
     complete_callback(state, scope, headers, provider, params).await
 }
@@ -320,8 +339,6 @@ async fn complete_callback(
     ) else {
         return Err(Problem::not_ready("auth-oidc needs its ports"));
     };
-    let config = state.provider_config(provider, clock)?;
-
     // The flow cookie is what makes this callback ours. Without it, or with
     // one that does not verify, there is nothing here worth reading.
     let Some(cookie) = flow::cookie_value(&headers) else {
@@ -335,13 +352,22 @@ async fn complete_callback(
     // returns it with an error response, so checking it first means a
     // stranger cannot abort somebody's login in progress by sending their
     // browser to `/callback?error=...`.
+    // Nothing above here clears the cookie, and nothing may: on a
+    // `form_post` provider this handler answers a cross-site POST that
+    // carries the flow cookie, so a request that has not matched the state
+    // is not evidence of anything. Clearing on one would hand a stranger a
+    // way to abort somebody's sign-in from any page they have open.
     let Some(returned_state) = query.state.as_deref() else {
-        return Ok(clear_flow(expired_page(), provider));
+        return Ok(expired_page());
     };
     if returned_state != flow.state {
         tracing::warn!("the state in a callback did not match the flow cookie");
         return Ok(refused(&scope).into_response());
     }
+    // Past here the request holds a state that matches a cookie this
+    // service signed, so it is the flow's own. Now the cookie may be spent,
+    // and the client secret is worth minting.
+    let config = state.provider_config(provider, clock)?;
 
     // The provider refused, or the person cancelled. Logged, never rendered.
     if let Some(error) = query.error.as_deref() {
@@ -368,14 +394,18 @@ async fn complete_callback(
     // the ID token, and it arrives exactly once: on every later sign-in
     // this field is absent, so if it is not taken here it is gone. It only
     // fills a gap, never overwrites what the ID token said.
-    if identity.name.is_none()
+    if provider.is_form_post()
+        && identity.name.is_none()
         && let Some(name) = query.user.as_deref().and_then(apple::name_from_user_field)
     {
         identity.name = Some(name);
     }
 
-    // A callback that arrives with a session cookie is a signed-in person
-    // adding a provider; the linking rules need to know that.
+    // A callback from a signed-in person is somebody adding a provider,
+    // and the linking rules need to know. The live cookie is the better
+    // answer where it arrives; on a cross-site POST it never does, so the
+    // flow carries what `/start` saw, re-checked here because the session
+    // may have been revoked in between.
     let presented = session_cookie_value(&headers);
     let current_user = match presented.as_deref() {
         Some(value) => factory0_auth_core::validate(db, clock, value)
@@ -383,7 +413,15 @@ async fn complete_callback(
             .ok()
             .flatten()
             .map(|session| session.user_id),
-        None => None,
+        None => match flow.signed_in_user.as_deref() {
+            Some(user_id) => factory0_auth_core::user_by_id(db, user_id)
+                .await
+                .ok()
+                .flatten()
+                .filter(|user| user.status == factory0_auth_core::STATUS_ACTIVE)
+                .map(|user| user.id),
+            None => None,
+        },
     };
 
     let ip = factory0_core::client_ip(&headers);

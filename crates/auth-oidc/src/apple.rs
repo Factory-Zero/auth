@@ -92,10 +92,17 @@ struct Cached {
     /// Unix seconds. Compared against the `Clock` port, never the wall
     /// clock, which is unreadable on wasm32 (ADR 0100) and untestable.
     good_until: i64,
-    /// The client id the secret was minted for. Configuration can change
-    /// between deploys within one isolate's life, and a secret minted for
-    /// another `sub` is refused by Apple rather than being merely stale.
+    /// The client id and key id the secret was minted for. Configuration
+    /// can change between deploys within one isolate's life, and a secret
+    /// minted for another `sub`, or signed by a key that has since been
+    /// revoked, is refused by Apple rather than being merely stale.
+    ///
+    /// The key id matters most: the documented rotation swaps the `.p8`
+    /// and the key id together and leaves the client id alone, so keying
+    /// on the client id by itself would serve a secret signed by the
+    /// revoked key for the rest of the cache window.
     client_id: String,
+    key_id: String,
 }
 
 /// Mints and caches Apple client secrets.
@@ -127,7 +134,7 @@ impl Minter {
         clock: &dyn Clock,
     ) -> Result<String, AppleKeyError> {
         let now = clock.now().unix_timestamp();
-        if let Some(hit) = self.cached_secret(client_id, now) {
+        if let Some(hit) = self.cached_secret(client_id, &config.key_id, now) {
             return Ok(hit);
         }
         let secret = sign_client_secret(config, client_id, now)?;
@@ -136,15 +143,17 @@ impl Minter {
                 secret: secret.clone(),
                 good_until: now + LIFETIME_SECS - REFRESH_MARGIN_SECS,
                 client_id: client_id.to_owned(),
+                key_id: config.key_id.clone(),
             });
         }
         Ok(secret)
     }
 
-    fn cached_secret(&self, client_id: &str, now: i64) -> Option<String> {
+    fn cached_secret(&self, client_id: &str, key_id: &str, now: i64) -> Option<String> {
         let slot = self.cached.read().ok()?;
         let cached = slot.as_ref()?;
-        (cached.client_id == client_id && cached.good_until > now).then(|| cached.secret.clone())
+        (cached.client_id == client_id && cached.key_id == key_id && cached.good_until > now)
+            .then(|| cached.secret.clone())
     }
 }
 
@@ -174,6 +183,20 @@ fn sign_client_secret(
     );
     let signature: ecdsa::Signature = signing.sign(signing_input.as_bytes());
     Ok(format!("{signing_input}.{}", b64url(&signature.to_bytes())))
+}
+
+/// Whether the configured `.p8` can actually sign.
+///
+/// Called from `validate_config`, so a corrupt key is a build failure
+/// rather than a 503 on every Apple request. Deliberately takes no clock:
+/// config validation runs at cold start, and the wall clock is unreadable
+/// on wasm32 (ADR 0100).
+///
+/// # Errors
+///
+/// [`AppleKeyError`] when the key is not a PKCS#8 P-256 private key.
+pub(crate) fn check_key(config: &AppleConfig) -> Result<(), AppleKeyError> {
+    signing_key(&config.private_key).map(|_| ())
 }
 
 /// Parses the `.p8`.
@@ -339,6 +362,32 @@ mod tests {
         assert_eq!(
             part(&third, 1)["exp"],
             later.now().unix_timestamp() + LIFETIME_SECS
+        );
+    }
+
+    #[test]
+    fn a_rotated_signing_key_is_not_served_from_the_cache() {
+        // The documented rotation swaps the `.p8` and the key id together
+        // and leaves the client id alone. Keying the cache on the client id
+        // by itself would keep signing with the revoked key for the rest of
+        // the window, and Apple answers `invalid_client`, which reads like a
+        // bad key rather than a stale one.
+        let minter = Minter::new();
+        let clock = at(1_800_000_000);
+        let old = AppleConfig {
+            key_id: "KEYOLD0000".into(),
+            ..config()
+        };
+        let new = AppleConfig {
+            key_id: "KEYNEW0000".into(),
+            ..config()
+        };
+        minter.mint(&old, "com.example.service", &clock).unwrap();
+        let after = minter.mint(&new, "com.example.service", &clock).unwrap();
+        assert_eq!(
+            part(&after, 0)["kid"],
+            "KEYNEW0000",
+            "the cache served a secret signed under the rotated-out key"
         );
     }
 

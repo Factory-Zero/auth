@@ -84,7 +84,14 @@ rand_core = { version = "0.6", default-features = false }
 # spike validated. `chrono` comes with them as an API type; its `clock`
 # feature is deliberately OFF, because `Utc::now()` panics on wasm32 and
 # modules read the wall clock through the `Clock` port anyway.
-openidconnect = { version = "4.0.1", default-features = false }
+#
+# `accept-string-booleans` exists for exactly one provider: Apple documents
+# `email_verified` as "a String or Boolean" and sends `"true"`. Without it
+# every real Apple sign-in fails ID-token verification with an "invalid
+# type: string" that no fake provider reproduces. Pure serde, wasm-safe.
+openidconnect = { version = "4.0.1", default-features = false, features = [
+    "accept-string-booleans",
+] }
 chrono = { version = "0.4", default-features = false, features = ["alloc"] }
 
 # Traits and errors.

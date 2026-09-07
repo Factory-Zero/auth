@@ -58,6 +58,11 @@ pub struct TokenClaims {
     pub issued_at: i64,
     pub expires_at: i64,
     pub key_id: String,
+    /// Send `email_verified` as the JSON string Apple sends rather than a
+    /// boolean. Apple documents the claim as "a String or Boolean", and a
+    /// fake that only ever mints a bool cannot catch a client that only
+    /// accepts one.
+    pub email_verified_as_string: bool,
 }
 
 impl Default for TokenClaims {
@@ -74,6 +79,7 @@ impl Default for TokenClaims {
             issued_at: 1_788_775_100,
             expires_at: 1_788_778_800,
             key_id: KEY_ID.to_owned(),
+            email_verified_as_string: false,
         }
     }
 }
@@ -192,6 +198,8 @@ impl TokenClaims {
             email: Some("nick@example.com".to_owned()),
             email_verified: true,
             name: None,
+            // What Apple actually sends.
+            email_verified_as_string: true,
             ..Self::default()
         }
     }
@@ -212,7 +220,11 @@ fn mint(claims: &TokenClaims) -> String {
     }
     if let Some(email) = &claims.email {
         body["email"] = json!(email);
-        body["email_verified"] = json!(claims.email_verified);
+        body["email_verified"] = if claims.email_verified_as_string {
+            json!(claims.email_verified.to_string())
+        } else {
+            json!(claims.email_verified)
+        };
     }
     if let Some(name) = &claims.name {
         body["name"] = json!(name);

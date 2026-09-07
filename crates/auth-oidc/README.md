@@ -75,7 +75,16 @@ the logs says why. Widening it gives up little — the cookie is signed,
 code and a matching `state` — and the alternative, a row keyed by the state,
 is worse: a row is spendable by anyone who saw the state in a redirect chain
 or a referrer, while a cookie is bound to the browser that started the flow.
+Nothing is cleared before the state matches, because on a `SameSite=None`
+cookie an unverified request is not evidence of anything: a stranger could
+otherwise abort a sign-in in progress from any page the victim has open.
 See [ADR 0102](../../docs/adr/0102-sign-in-with-apple.md).
+
+**The session cookie is also `SameSite=Lax`,** so it does not arrive on a
+`form_post` callback either. `/start` is same-site, so it arrives there; the
+signed-in user is validated there and sealed into the flow, and the callback
+uses that when no live session cookie arrives. Without it, a signed-in person
+adding Apple would silently get a second account.
 
 **The expiry lives in the signed payload**, not in the signer's own `exp`,
 because `Signer::verify` compares against the wall clock rather than the
