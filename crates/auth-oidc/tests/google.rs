@@ -351,13 +351,36 @@ fn an_unknown_provider_is_not_found() {
     pollster::block_on(async {
         let kit = kit();
         for path in [
-            "/v1/auth-oidc/apple/start",
             "/v1/auth-oidc/nonsense/start",
             "/v1/auth-oidc/nonsense/callback?code=x&state=y",
         ] {
             let response = get(&kit, path, &[]).await;
             assert_eq!(response.status, StatusCode::NOT_FOUND, "{path}");
         }
+
+        // Apple is a provider this module serves (#16); on a kit that
+        // configures only Google it is unconfigured, which is a different
+        // answer from unknown and a much more useful one.
+        let response = get(&kit, "/v1/auth-oidc/apple/start", &[]).await;
+        assert_eq!(response.status, StatusCode::SERVICE_UNAVAILABLE);
+    });
+}
+
+#[test]
+fn each_provider_answers_only_on_the_callback_method_it_uses() {
+    // Apple posts and Google redirects. Serving both methods for both
+    // would mean an authorization response could be delivered through a
+    // path the provider never uses.
+    pollster::block_on(async {
+        let kit = kit();
+        // Google has no form_post callback.
+        let response =
+            support::post_form(&kit, "/v1/auth-oidc/google/callback", "code=x&state=y").await;
+        assert_eq!(response.status, StatusCode::NOT_FOUND);
+
+        // Apple has no redirect callback.
+        let response = get(&kit, "/v1/auth-oidc/apple/callback?code=x&state=y", &[]).await;
+        assert_eq!(response.status, StatusCode::NOT_FOUND);
     });
 }
 

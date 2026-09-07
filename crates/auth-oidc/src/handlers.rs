@@ -1,10 +1,15 @@
-//! The two routes (issue #15): `/{provider}/start` and
-//! `/{provider}/callback`.
+//! The routes (issues #15, #16): `/{provider}/start`, and
+//! `/{provider}/callback` on the one method that provider uses.
 //!
-//! Both are public. `/start` is guarded by the rate limiter and by nothing
-//! else, because there is nothing yet to guard; `/callback` is guarded by
+//! All are public. `/start` is guarded by the rate limiter and by nothing
+//! else, because there is nothing yet to guard; a callback is guarded by
 //! the signed flow cookie, which is the only thing that makes a callback
 //! ours rather than anybody's.
+//!
+//! The callback exists twice because Apple posts where everyone else
+//! redirects (ADR 0102). Both methods share one body; each refuses the
+//! providers that do not use it, so an authorization response can only be
+//! delivered the way its own provider delivers it.
 
 use axum::extract::{Path, Query, State};
 use axum::response::{Html, IntoResponse, Response};
@@ -21,11 +26,12 @@ use openidconnect::{
 use serde::Deserialize;
 use std::sync::Arc;
 
+use crate::apple;
 use crate::discovery::{PortHttpClient, key_id_of};
 use crate::flow::{self, Flow};
 use crate::provider::{self, Provider};
 use crate::session::{self, Completed, Identity};
-use crate::{CALLBACK_REFUSED, ModuleState, PROVIDER_UNAVAILABLE, PROVIDER_UNCONFIGURED};
+use crate::{CALLBACK_REFUSED, ModuleState, PROVIDER_UNAVAILABLE};
 
 /// 32 bytes each for the state, the nonce and the PKCE verifier. Generated
 /// here rather than through `openidconnect`'s helpers so every random value
@@ -38,7 +44,10 @@ const MAX_RETURN_TO: usize = 512;
 pub(crate) fn router() -> axum::Router<Arc<ModuleState>> {
     axum::Router::new()
         .route("/{provider}/start", get(start))
-        .route("/{provider}/callback", get(callback))
+        // Two methods, one path. A provider uses exactly one of them and
+        // the other answers 404 for it, so a `form_post` provider cannot
+        // be completed through the query-string route and vice versa.
+        .route("/{provider}/callback", get(callback).post(callback_form))
 }
 
 #[derive(Debug, Deserialize)]
@@ -46,11 +55,18 @@ pub(crate) struct StartQuery {
     return_to: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-pub(crate) struct CallbackQuery {
+/// The authorization response, however it arrived.
+///
+/// Apple's `form_post` carries the same three fields as a redirect plus
+/// `user`, which no other provider sends and which arrives only on the
+/// very first authorization.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct CallbackParams {
     code: Option<String>,
     state: Option<String>,
     error: Option<String>,
+    /// Apple only: JSON with the person's name, once and never again.
+    user: Option<String>,
 }
 
 /// Where the browser may be sent after signing in.
@@ -131,7 +147,7 @@ fn provider_of(slug: &str) -> Result<&'static Provider, Problem> {
 /// Builds the provider client. The concrete type is not nameable without
 /// spelling out openidconnect's type-state, so it is built where it is used.
 macro_rules! oidc_client {
-    ($metadata:expr, $config:expr) => {
+    ($metadata:expr, $config:expr, $provider:expr) => {
         RedirectUrl::new($config.redirect_uri.clone()).map(|redirect| {
             CoreClient::from_provider_metadata(
                 $metadata,
@@ -139,6 +155,8 @@ macro_rules! oidc_client {
                 Some(ClientSecret::new($config.client_secret.clone())),
             )
             .set_redirect_uri(redirect)
+            // Pinned by the descriptor rather than read from the document.
+            .set_auth_type($provider.auth_type.as_oauth())
         })
     };
 }
@@ -163,9 +181,7 @@ async fn start(
     ) else {
         return Err(Problem::not_ready("auth-oidc needs http, clock and signer"));
     };
-    let config = settings
-        .provider_config(&*ctx.config, provider)
-        .ok_or_else(|| Problem::new(&PROVIDER_UNCONFIGURED))?;
+    let config = state.provider_config(provider, clock)?;
 
     let metadata = state
         .discovery
@@ -183,7 +199,7 @@ async fn start(
         return Err(Problem::internal().instance(&scope.request_id));
     };
 
-    let client = oidc_client!(metadata, config).map_err(|err| {
+    let client = oidc_client!(metadata, config, provider).map_err(|err| {
         tracing::error!(error = %err, "the configured redirect uri is not a url");
         unavailable(&scope)
     })?;
@@ -203,6 +219,13 @@ async fn start(
     for scope in provider.scopes {
         request = request.add_scope(OidcScope::new((*scope).to_owned()));
     }
+    if provider.is_form_post() {
+        // Apple returns the response as a cross-site POST. It does this
+        // anyway once `name` or `email` is requested, but saying so makes
+        // the descriptor and the callback route agree out loud rather than
+        // by coincidence.
+        request = request.add_extra_param("response_mode", "form_post");
+    }
     let (url, csrf, _nonce) = request.url();
     let csrf = csrf.secret().clone();
 
@@ -220,26 +243,73 @@ async fn start(
     Ok((
         StatusCode::FOUND,
         [
-            (header::SET_COOKIE, flow::set_cookie(&sealed)),
+            (
+                header::SET_COOKIE,
+                flow::set_cookie(&sealed, flow::SameSite::for_provider(provider)),
+            ),
             (header::LOCATION, url.to_string()),
         ],
     )
         .into_response())
 }
 
-#[allow(clippy::too_many_lines)]
+/// The redirect callback: every provider but Apple.
 async fn callback(
     State(state): State<Arc<ModuleState>>,
     scope: Scope,
     headers: HeaderMap,
     Path(slug): Path<String>,
-    Query(query): Query<CallbackQuery>,
+    Query(query): Query<CallbackParams>,
+) -> Result<Response, Problem> {
+    let provider = provider_of(&slug)?;
+    if provider.is_form_post() {
+        // Apple posts. A GET here is somebody poking at the route, and
+        // answering it would mean accepting an authorization response
+        // through a path this provider never uses.
+        return Err(Problem::not_found());
+    }
+    complete_callback(state, scope, headers, provider, query).await
+}
+
+/// The `form_post` callback: Apple only (#3, #16).
+///
+/// The body is `application/x-www-form-urlencoded`, which needs the
+/// harness's `form` feature (Cratefield/harness#46). The request is
+/// cross-site, so the flow cookie only arrives because `/start` set it
+/// with `SameSite=None` for this provider.
+async fn callback_form(
+    State(state): State<Arc<ModuleState>>,
+    scope: Scope,
+    headers: HeaderMap,
+    Path(slug): Path<String>,
+    body: String,
+) -> Result<Response, Problem> {
+    let provider = provider_of(&slug)?;
+    if !provider.is_form_post() {
+        return Err(Problem::not_found());
+    }
+    // Parsed here rather than through the `Form` extractor so a malformed
+    // body gets this module's page instead of axum's rejection text, and
+    // so the answer is identical to a missing `state`: a body that will
+    // not parse is either a spoofed post or a provider change, and neither
+    // is worth telling the sender apart.
+    let Ok(params) = serde_urlencoded::from_str::<CallbackParams>(&body) else {
+        return Ok(clear_flow(expired_page(), provider));
+    };
+    complete_callback(state, scope, headers, provider, params).await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn complete_callback(
+    state: Arc<ModuleState>,
+    scope: Scope,
+    headers: HeaderMap,
+    provider: &'static Provider,
+    query: CallbackParams,
 ) -> Result<Response, Problem> {
     if let Some(limited) = limit(&state, &headers).await {
         return Ok(limited);
     }
-    let provider = provider_of(&slug)?;
-    let settings = state.settings()?;
     let ctx = state.ctx.as_ref();
     let (Some(db), Some(http), Some(clock), Some(signer), Some(id_gen)) = (
         ctx.ports.db.as_deref(),
@@ -250,9 +320,7 @@ async fn callback(
     ) else {
         return Err(Problem::not_ready("auth-oidc needs its ports"));
     };
-    let config = settings
-        .provider_config(&*ctx.config, provider)
-        .ok_or_else(|| Problem::new(&PROVIDER_UNCONFIGURED))?;
+    let config = state.provider_config(provider, clock)?;
 
     // The flow cookie is what makes this callback ours. Without it, or with
     // one that does not verify, there is nothing here worth reading.
@@ -268,7 +336,7 @@ async fn callback(
     // stranger cannot abort somebody's login in progress by sending their
     // browser to `/callback?error=...`.
     let Some(returned_state) = query.state.as_deref() else {
-        return Ok(clear_flow(expired_page()));
+        return Ok(clear_flow(expired_page(), provider));
     };
     if returned_state != flow.state {
         tracing::warn!("the state in a callback did not match the flow cookie");
@@ -278,20 +346,33 @@ async fn callback(
     // The provider refused, or the person cancelled. Logged, never rendered.
     if let Some(error) = query.error.as_deref() {
         tracing::info!(provider = provider.slug, provider_error = %error, "sign-in was not granted");
-        return Ok(clear_flow(page(
-            StatusCode::OK,
-            "Sign-in was not completed. You can close this tab and try again.",
-        )));
+        return Ok(clear_flow(
+            page(
+                StatusCode::OK,
+                "Sign-in was not completed. You can close this tab and try again.",
+            ),
+            provider,
+        ));
     }
 
     let Some(code) = query.code.as_deref() else {
-        return Ok(clear_flow(expired_page()));
+        return Ok(clear_flow(expired_page(), provider));
     };
 
-    let identity = match exchange(&state, provider, &config, clock, &http, &flow, code).await {
+    let mut identity = match exchange(&state, provider, &config, clock, &http, &flow, code).await {
         Ok(identity) => identity,
-        Err(problem) => return Ok(clear_flow(problem.into_response())),
+        Err(problem) => return Ok(clear_flow(problem.into_response(), provider)),
     };
+
+    // Apple's first-authorization name (#3). It is in the form body, not
+    // the ID token, and it arrives exactly once: on every later sign-in
+    // this field is absent, so if it is not taken here it is gone. It only
+    // fills a gap, never overwrites what the ID token said.
+    if identity.name.is_none()
+        && let Some(name) = query.user.as_deref().and_then(apple::name_from_user_field)
+    {
+        identity.name = Some(name);
+    }
 
     // A callback that arrives with a session cookie is a signed-in person
     // adding a provider; the linking rules need to know that.
@@ -331,14 +412,17 @@ async fn callback(
             // and the session cookie would never reach the browser.
             let mut response =
                 (StatusCode::FOUND, [(header::LOCATION, flow.return_to)]).into_response();
-            for cookie in [session::session_cookie(&session), flow::clear_cookie()] {
+            for cookie in [
+                session::session_cookie(&session),
+                flow::clear_cookie(flow::SameSite::for_provider(provider)),
+            ] {
                 if let Ok(value) = header::HeaderValue::from_str(&cookie) {
                     response.headers_mut().append(header::SET_COOKIE, value);
                 }
             }
             response
         }
-        Completed::NeedsPerson { message } => clear_flow(page(StatusCode::OK, message)),
+        Completed::NeedsPerson { message } => clear_flow(page(StatusCode::OK, message), provider),
     })
 }
 
@@ -365,7 +449,7 @@ async fn exchange(
 
     let oidc_http = PortHttpClient::new(Arc::clone(http));
     let token = {
-        let client = oidc_client!(metadata.clone(), config).map_err(|err| {
+        let client = oidc_client!(metadata.clone(), config, provider).map_err(|err| {
             tracing::error!(error = %err, "the configured redirect uri is not a url");
             Problem::new(&PROVIDER_UNAVAILABLE)
         })?;
@@ -409,7 +493,7 @@ async fn exchange(
     };
 
     let claims = {
-        let client = oidc_client!(metadata, config).map_err(|err| {
+        let client = oidc_client!(metadata, config, provider).map_err(|err| {
             tracing::error!(error = %err, "the configured redirect uri is not a url");
             Problem::new(&PROVIDER_UNAVAILABLE)
         })?;
@@ -461,9 +545,13 @@ fn expired_page() -> Response {
 
 /// Adds the header that clears the flow cookie, so a spent or abandoned
 /// flow does not linger in the browser.
-fn clear_flow(response: Response) -> Response {
+///
+/// The provider decides the `SameSite` on the clear, for the same reason it
+/// decided it on the cookie.
+fn clear_flow(response: Response, provider: &Provider) -> Response {
     let mut response = response;
-    if let Ok(value) = header::HeaderValue::from_str(&flow::clear_cookie()) {
+    let cookie = flow::clear_cookie(flow::SameSite::for_provider(provider));
+    if let Ok(value) = header::HeaderValue::from_str(&cookie) {
         response.headers_mut().append(header::SET_COOKIE, value);
     }
     response

@@ -52,8 +52,7 @@ validated before the issues were written, and what is deferred.
 |---|---|
 | `auth-core` | schema, clients, sessions, tokens, the authorization flow, account linking |
 | `auth-passkeys` | WebAuthn registration and login |
-| `auth-oidc` | Google, and the machinery Apple reuses |
-| `auth-apple` | minted client secret, form_post callback, first-authorization name |
+| `auth-oidc` | Google and Apple: discovery, PKCE, ID tokens, minted Apple client secret, form_post callback |
 | `auth-meta` | OAuth2 plus Graph profile, data deletion callback |
 | `auth-password` | argon2id registration and login, breach check |
 | `auth-magic-link` | request and single-use consume |

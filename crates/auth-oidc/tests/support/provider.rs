@@ -23,6 +23,16 @@ pub const AUTHORIZATION_ENDPOINT: &str = "https://accounts.google.com/o/oauth2/v
 pub const CLIENT_ID: &str = "test-client.apps.googleusercontent.com";
 pub const KEY_ID: &str = "test-key-1";
 
+// Apple (#16). Same machinery, different host: the issuer is checked for
+// real, so a fake that answered every discovery with Google's issuer would
+// make the Apple tests prove nothing.
+pub const APPLE_ISSUER: &str = "https://appleid.apple.com";
+pub const APPLE_JWKS_URI: &str = "https://appleid.apple.com/auth/keys";
+pub const APPLE_TOKEN_ENDPOINT: &str = "https://appleid.apple.com/auth/token";
+pub const APPLE_AUTHORIZATION_ENDPOINT: &str = "https://appleid.apple.com/auth/authorize";
+/// Apple calls this the Services ID.
+pub const APPLE_CLIENT_ID: &str = "com.example.service";
+
 /// One 2048-bit key for the whole test binary; generating one per test would
 /// dominate the run.
 fn key() -> &'static rsa::RsaPrivateKey {
@@ -169,6 +179,24 @@ impl FakeProvider {
     }
 }
 
+impl TokenClaims {
+    /// The shape Apple sends: its issuer, the Services ID as the audience,
+    /// a `pairwise` subject, and no `name` claim, because Apple never puts
+    /// the name in the ID token. That is the whole reason the name has to
+    /// come out of the form body instead.
+    pub fn apple() -> Self {
+        Self {
+            issuer: APPLE_ISSUER.to_owned(),
+            audience: APPLE_CLIENT_ID.to_owned(),
+            subject: "apple-subject-1".to_owned(),
+            email: Some("nick@example.com".to_owned()),
+            email_verified: true,
+            name: None,
+            ..Self::default()
+        }
+    }
+}
+
 /// A Google-shaped ID token, signed for real with the test key.
 fn mint(claims: &TokenClaims) -> String {
     let header = json!({ "alg": "RS256", "typ": "JWT", "kid": claims.key_id });
@@ -223,9 +251,31 @@ impl HttpClient for FakeProvider {
             .expect("lock")
             .push((method.clone(), url.clone(), body));
 
+        let apple = url.contains("appleid.apple.com");
+
         if url.contains("/.well-known/openid-configuration") {
             if let Some(status) = *self.inner.discovery_error.read().expect("lock") {
                 return Ok(json_response(status, &json!({ "error": "unavailable" })));
+            }
+            if apple {
+                return Ok(json_response(
+                    200,
+                    &json!({
+                        "issuer": APPLE_ISSUER,
+                        "authorization_endpoint": APPLE_AUTHORIZATION_ENDPOINT,
+                        "token_endpoint": APPLE_TOKEN_ENDPOINT,
+                        "jwks_uri": APPLE_JWKS_URI,
+                        "response_types_supported": ["code"],
+                        "subject_types_supported": ["pairwise"],
+                        "id_token_signing_alg_values_supported": ["RS256"],
+                        // Apple's own document lists exactly these, and
+                        // `form_post` is why the callback is a POST.
+                        "response_modes_supported": ["query", "fragment", "form_post"],
+                        "token_endpoint_auth_methods_supported": ["client_secret_post"],
+                        "scopes_supported": ["openid", "email", "name"],
+                        "claims_supported": ["sub", "email", "email_verified"],
+                    }),
+                ));
             }
             return Ok(json_response(
                 200,
@@ -243,11 +293,11 @@ impl HttpClient for FakeProvider {
             ));
         }
 
-        if url.starts_with(JWKS_URI) {
+        if url.starts_with(JWKS_URI) || url.starts_with(APPLE_JWKS_URI) {
             return Ok(json_response(200, &self.jwks()));
         }
 
-        if url.starts_with(TOKEN_ENDPOINT) {
+        if url.starts_with(TOKEN_ENDPOINT) || url.starts_with(APPLE_TOKEN_ENDPOINT) {
             if let Some((status, body)) = self.inner.token_error.read().expect("lock").clone() {
                 return Ok(json_response(status, &body));
             }

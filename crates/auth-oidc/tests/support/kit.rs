@@ -13,11 +13,27 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use time::OffsetDateTime;
 
-use crate::support::provider::{CLIENT_ID, FakeProvider};
+use crate::support::provider::{APPLE_CLIENT_ID, CLIENT_ID, FakeProvider};
 
 pub const REDIRECT_BASE: &str = "https://auth.factory0.ventures";
 pub const START: &str = "/v1/auth-oidc/google/start";
 pub const CALLBACK: &str = "/v1/auth-oidc/google/callback";
+pub const APPLE_START: &str = "/v1/auth-oidc/apple/start";
+pub const APPLE_CALLBACK: &str = "/v1/auth-oidc/apple/callback";
+
+/// A throwaway P-256 key in the PKCS#8 PEM shape Apple issues as a `.p8`.
+///
+/// Derived from a fixed scalar rather than pasted, so it is certainly a
+/// valid key: a hand-written PEM that does not parse makes every Apple
+/// test fail as "unconfigured", which points at the wrong thing entirely.
+pub fn apple_p8() -> String {
+    use p256::pkcs8::EncodePrivateKey as _;
+    p256::SecretKey::from_slice(&[7u8; 32])
+        .expect("a valid P-256 scalar")
+        .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)
+        .expect("encodes")
+        .to_string()
+}
 
 pub struct TestClock(AtomicI64);
 
@@ -60,6 +76,29 @@ pub fn config_pairs() -> Vec<(String, String)> {
             "test-client-secret".to_owned(),
         ),
     ]
+}
+
+/// Google's settings plus Apple's four (#16). Apple takes no client
+/// secret: it is minted from the signing key on every exchange.
+pub fn config_pairs_with_apple() -> Vec<(String, String)> {
+    let mut pairs = config_pairs();
+    pairs.extend([
+        (
+            "AUTH_OIDC_APPLE_CLIENT_ID".to_owned(),
+            APPLE_CLIENT_ID.to_owned(),
+        ),
+        (
+            "AUTH_OIDC_APPLE_TEAM_ID".to_owned(),
+            "TEAM123456".to_owned(),
+        ),
+        ("AUTH_OIDC_APPLE_KEY_ID".to_owned(), "KEY7890123".to_owned()),
+        ("AUTH_OIDC_APPLE_PRIVATE_KEY".to_owned(), apple_p8()),
+    ]);
+    pairs
+}
+
+pub fn apple_kit() -> Kit {
+    kit_with(config_pairs_with_apple())
 }
 
 pub fn kit() -> Kit {
@@ -165,6 +204,52 @@ pub async fn get(kit: &Kit, path: &str, cookies: &[(&str, &str)]) -> Res {
     }
 }
 
+/// A form-encoded `POST`, which is how Apple delivers its authorization
+/// response (#16). Cross-site in life; here it is just a POST with a body.
+pub async fn post_form(kit: &Kit, path: &str, body: &str) -> Res {
+    post_form_with(kit, path, body, &[]).await
+}
+
+/// The same, carrying cookies.
+pub async fn post_form_with(kit: &Kit, path: &str, body: &str, cookies: &[(&str, &str)]) -> Res {
+    use tower::ServiceExt;
+    let mut builder = axum::http::Request::builder()
+        .method(http::Method::POST)
+        .uri(path)
+        .header(
+            http::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        );
+    if !cookies.is_empty() {
+        let joined = cookies
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        builder = builder.header(http::header::COOKIE, joined);
+    }
+    let response = kit
+        .harness
+        .router
+        .clone()
+        .oneshot(
+            builder
+                .body(axum::body::Body::from(body.to_owned()))
+                .expect("request"),
+        )
+        .await
+        .expect("router answers");
+    let (parts, body) = response.into_parts();
+    let body = axum::body::to_bytes(body, 4 * 1024 * 1024)
+        .await
+        .expect("body reads");
+    Res {
+        status: parts.status,
+        headers: parts.headers,
+        body: body.to_vec(),
+    }
+}
+
 /// What `/start` produced: the flow cookie, and the state and nonce the
 /// module put in the authorization URL.
 pub struct Started {
@@ -175,7 +260,12 @@ pub struct Started {
 }
 
 pub async fn start(kit: &Kit, query: &str) -> Started {
-    let response = get(kit, &format!("{START}{query}"), &[]).await;
+    start_at(kit, START, query).await
+}
+
+/// `/start` for whichever provider the path names.
+pub async fn start_at(kit: &Kit, path: &str, query: &str) -> Started {
+    let response = get(kit, &format!("{path}{query}"), &[]).await;
     assert_eq!(
         response.status,
         StatusCode::FOUND,

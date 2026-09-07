@@ -22,6 +22,7 @@ http = { workspace = true }
 bytes = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_urlencoded = { workspace = true }
 time = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
@@ -30,6 +31,9 @@ getrandom = { workspace = true }
 url = { workspace = true }
 openidconnect = { workspace = true }
 chrono = { workspace = true }
+# Apple's client secret is an ES256 JWT this module mints from a PKCS#8
+# key, not a string an operator pastes (#16).
+p256 = { workspace = true }
 
 [dev-dependencies]
 factory0-testing = { workspace = true }
@@ -37,7 +41,6 @@ factory0-adapter-sqlite = { workspace = true }
 pollster = { workspace = true }
 tower = { workspace = true }
 async-trait = { workspace = true }
-p256 = { workspace = true }
 sha2 = { workspace = true }
 rsa = { workspace = true }
 rand = "0.8"

@@ -81,18 +81,68 @@ impl Flow {
 }
 
 /// The `Set-Cookie` value that carries a flow.
-pub(crate) fn set_cookie(value: &str) -> String {
-    // `SameSite=Lax` and not `Strict`: the callback arrives as a top-level
-    // navigation from the provider, and `Strict` would withhold the cookie
-    // on exactly that request.
-    format!("{COOKIE_NAME}={value}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age={TTL_SECS}")
+///
+/// `same_site` is decided by the provider's response mode, and it is the
+/// one place Apple's `form_post` reaches into the cookie:
+///
+/// - **`Lax`** for a redirect callback, and not `Strict`, because the
+///   callback arrives as a top-level navigation from the provider and
+///   `Strict` would withhold the cookie on exactly that request.
+/// - **`None`** for a `form_post` callback. A browser sends no `Lax` cookie
+///   on a cross-site `POST`, so a `Lax` cookie here does not arrive at all
+///   and every Apple sign-in looks like an expired flow.
+///
+/// Widening to `None` costs less than it looks. The cookie is signed, so it
+/// cannot be forged; `__Host-` keeps it origin-locked; it lives ten
+/// minutes; and the only thing a holder can do with it is finish the flow
+/// it belongs to, which also needs the provider's own code and a `state`
+/// that matches. The alternative the spike weighed, a row keyed by the
+/// `state`, is worse for the reason this cookie exists at all: a row is
+/// spendable by anyone who saw the state in a redirect chain or a referrer,
+/// while a cookie is bound to the browser that started the flow.
+pub(crate) fn set_cookie(value: &str, same_site: SameSite) -> String {
+    format!(
+        "{COOKIE_NAME}={value}; Path=/; Secure; HttpOnly; SameSite={}; Max-Age={TTL_SECS}",
+        same_site.as_str()
+    )
+}
+
+/// The `SameSite` a flow cookie is set with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SameSite {
+    Lax,
+    None,
+}
+
+impl SameSite {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Lax => "Lax",
+            Self::None => "None",
+        }
+    }
+
+    /// The policy a provider's response mode requires.
+    pub(crate) fn for_provider(provider: &crate::provider::Provider) -> Self {
+        if provider.is_form_post() {
+            Self::None
+        } else {
+            Self::Lax
+        }
+    }
 }
 
 /// The `Set-Cookie` value that clears it, sent once the flow is spent.
-pub(crate) fn clear_cookie() -> String {
+///
+/// Carries the same `SameSite` the cookie was set with. A browser keys a
+/// cookie on name, domain and path, so a mismatch would still clear it,
+/// but a clear that does not look like the thing it clears is the kind of
+/// detail that survives a refactor and then does not.
+pub(crate) fn clear_cookie(same_site: SameSite) -> String {
     format!(
-        "{COOKIE_NAME}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0; \
-         Expires=Thu, 01 Jan 1970 00:00:00 GMT"
+        "{COOKIE_NAME}=; Path=/; Secure; HttpOnly; SameSite={}; Max-Age=0; \
+         Expires=Thu, 01 Jan 1970 00:00:00 GMT",
+        same_site.as_str()
     )
 }
 
@@ -196,7 +246,7 @@ mod tests {
 
     #[test]
     fn the_cookie_is_origin_locked_and_survives_the_providers_redirect() {
-        let header = set_cookie("value");
+        let header = set_cookie("value", SameSite::Lax);
         assert!(header.starts_with("__Host-fz_oidc="), "{header}");
         assert!(header.contains("Secure"), "{header}");
         assert!(header.contains("HttpOnly"), "{header}");
@@ -204,6 +254,41 @@ mod tests {
         // provider, and Strict would withhold the cookie on it.
         assert!(header.contains("SameSite=Lax"), "{header}");
         assert!(!header.contains("Domain="), "__Host- forbids a domain");
+    }
+
+    #[test]
+    fn a_form_post_provider_gets_a_cookie_a_cross_site_post_can_carry() {
+        // This is the whole of Apple's second quirk. A browser sends no
+        // `Lax` cookie on a cross-site POST, so with `Lax` here the flow
+        // cookie never arrives and every Apple sign-in reads as expired.
+        assert_eq!(
+            SameSite::for_provider(&crate::provider::APPLE),
+            SameSite::None
+        );
+        assert_eq!(
+            SameSite::for_provider(&crate::provider::GOOGLE),
+            SameSite::Lax
+        );
+
+        let header = set_cookie("value", SameSite::None);
+        assert!(header.contains("SameSite=None"), "{header}");
+        // `SameSite=None` without `Secure` is rejected outright by every
+        // current browser, so the two travel together or not at all.
+        assert!(header.contains("Secure"), "{header}");
+        assert!(header.starts_with("__Host-fz_oidc="), "{header}");
+        assert!(!header.contains("Domain="), "{header}");
+    }
+
+    #[test]
+    fn the_clear_matches_the_cookie_it_clears() {
+        for same_site in [SameSite::Lax, SameSite::None] {
+            let set = set_cookie("value", same_site);
+            let clear = clear_cookie(same_site);
+            let attribute = format!("SameSite={}", same_site.as_str());
+            assert!(set.contains(&attribute), "{set}");
+            assert!(clear.contains(&attribute), "{clear}");
+            assert!(clear.contains("Max-Age=0"), "{clear}");
+        }
     }
 
     #[test]
