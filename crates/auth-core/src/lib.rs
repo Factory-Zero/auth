@@ -51,19 +51,22 @@ pub use sessions::{
 };
 pub use store::{
     Bytes, CLIENT_CONFIDENTIAL, CLIENT_PUBLIC, CREDENTIAL_PASSKEY, CREDENTIAL_PASSWORD,
-    ClientRedirectUriRow, ClientRow, CredentialRow, IdentityRow, PROVIDER_APPLE, PROVIDER_GOOGLE,
-    PROVIDER_MAGIC_LINK, PROVIDER_META, PROVIDER_PASSKEY, PROVIDER_PASSWORD, Redacted,
-    STATUS_ACTIVE, STATUS_DISABLED, SessionRow, SingleUseTokenRow, TOKEN_AUTHORIZATION_CODE,
-    TOKEN_MAGIC_LINK, TOKEN_REFRESH, TOKEN_WEBAUTHN_CHALLENGE, UserRow, client_by_id,
-    consume_single_use_token, credentials_by_user, delete_credential, delete_user,
-    identities_by_user, identity_by_provider_subject, insert_client, insert_credential,
+    ClientRedirectUriRow, ClientRow, CredentialRow, DELETION_DELETED_USER, DELETION_DONE,
+    DELETION_NOTHING_TO_DO, DELETION_PENDING, DELETION_UNLINKED, DeletionJobRow, IdentityRow,
+    PROVIDER_APPLE, PROVIDER_GOOGLE, PROVIDER_MAGIC_LINK, PROVIDER_META, PROVIDER_PASSKEY,
+    PROVIDER_PASSWORD, Redacted, STATUS_ACTIVE, STATUS_DISABLED, SessionRow, SingleUseTokenRow,
+    TOKEN_AUTHORIZATION_CODE, TOKEN_MAGIC_LINK, TOKEN_REFRESH, TOKEN_WEBAUTHN_CHALLENGE, UserRow,
+    client_by_id, complete_deletion_job, consume_single_use_token, credentials_by_user,
+    delete_credential, delete_identity, delete_user, deletion_job_by_code, identities_by_user,
+    identity_by_provider_subject, insert_client, insert_credential, insert_deletion_job,
     insert_identity, insert_redirect_uri, insert_session, insert_single_use_token, insert_user,
-    list_clients, mark_passkey_suspect, passkey_by_credential_id, purge_expired_sessions,
-    purge_expired_single_use_tokens, redirect_uris_for_client, replace_redirect_uris,
-    revoke_all_sessions, revoke_session, rotate_client_secret, session_by_id,
-    session_by_token_hash, sessions_by_user, single_use_token_by_hash, slide_session,
-    touch_credential_used, touch_identity_login, touch_session_seen, update_client_name,
-    update_client_status, update_passkey_sign_count, user_by_id, user_by_primary_email,
+    list_clients, mark_passkey_suspect, passkey_by_credential_id, pending_deletion_jobs,
+    purge_expired_sessions, purge_expired_single_use_tokens, purge_user, redirect_uris_for_client,
+    replace_redirect_uris, revoke_all_sessions, revoke_session, rotate_client_secret,
+    session_by_id, session_by_token_hash, sessions_by_user, single_use_token_by_hash,
+    slide_session, touch_credential_used, touch_identity_login, touch_session_seen,
+    update_client_name, update_client_status, update_passkey_sign_count, user_by_id,
+    user_by_primary_email,
 };
 pub use tokens::{
     ACCESS_TOKEN_SECS, JWKS_CACHE_CONTROL, OIDC_CACHE_CONTROL, REFRESH_TOKEN_DAYS, RefreshGrant,
@@ -95,6 +98,14 @@ const MIGRATION_ROTATION: SqlMigration = SqlMigration {
     id: "0002",
     name: "client_secret_rotation",
     sql: include_str!("../migrations/sqlite/0002_client_secret_rotation.sql"),
+};
+
+/// The deletion-job table of issue #18: a provider's "delete this
+/// person's data" request, recorded before it is carried out.
+const MIGRATION_DELETION_JOBS: SqlMigration = SqlMigration {
+    id: "0005",
+    name: "deletion_jobs",
+    sql: include_str!("../migrations/sqlite/0005_deletion_jobs.sql"),
 };
 
 /// The passkey clone signal of issue #14: `credentials.passkey_suspect_at`.
@@ -198,11 +209,12 @@ impl Module for AuthCore {
     }
 
     fn migrations(&self) -> factory0_core::Migrations {
-        const MIGRATIONS: [SqlMigration; 4] = [
+        const MIGRATIONS: [SqlMigration; 5] = [
             MIGRATION_INIT,
             MIGRATION_ROTATION,
             MIGRATION_TOKENS,
             MIGRATION_SUSPECT,
+            MIGRATION_DELETION_JOBS,
         ];
         factory0_core::Migrations {
             sqlite: &MIGRATIONS,
@@ -299,7 +311,7 @@ mod tests {
     #[test]
     fn migrations_are_the_embedded_set_in_order() {
         let migrations = AuthCore::new().migrations();
-        assert_eq!(migrations.sqlite.len(), 4);
+        assert_eq!(migrations.sqlite.len(), 5);
         assert_eq!(migrations.sqlite[0].id, "0001");
         assert_eq!(migrations.sqlite[0].name, "init");
         assert_eq!(migrations.sqlite[1].id, "0002");
@@ -308,6 +320,8 @@ mod tests {
         assert_eq!(migrations.sqlite[2].name, "token_issuing");
         assert_eq!(migrations.sqlite[3].id, "0004");
         assert_eq!(migrations.sqlite[3].name, "passkey_suspect");
+        assert_eq!(migrations.sqlite[4].id, "0005");
+        assert_eq!(migrations.sqlite[4].name, "deletion_jobs");
         assert!(migrations.postgres.is_empty());
         assert_eq!(
             migrations.sqlite[0].sql,
@@ -320,6 +334,10 @@ mod tests {
         assert_eq!(
             migrations.sqlite[2].sql,
             include_str!("../migrations/sqlite/0003_token_issuing.sql")
+        );
+        assert_eq!(
+            migrations.sqlite[4].sql,
+            include_str!("../migrations/sqlite/0005_deletion_jobs.sql")
         );
     }
 

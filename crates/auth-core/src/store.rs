@@ -1319,3 +1319,187 @@ pub(crate) async fn scheduled_purge(ctx: &ModuleContext, cron: &str) -> Result<(
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// deletion_jobs (issue #18)
+
+pub const DELETION_PENDING: &str = "pending";
+pub const DELETION_DONE: &str = "done";
+
+/// What carrying out a deletion request actually did.
+pub const DELETION_UNLINKED: &str = "unlinked";
+pub const DELETION_DELETED_USER: &str = "deleted_user";
+pub const DELETION_NOTHING_TO_DO: &str = "nothing_to_do";
+
+/// A provider's request to delete a person's data, recorded before it is
+/// carried out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletionJobRow {
+    pub id: String,
+    pub provider: String,
+    pub provider_subject: String,
+    pub confirmation_code: String,
+    pub status: String,
+    pub outcome: Option<String>,
+    pub created_at: String,
+    pub completed_at: Option<String>,
+}
+
+fn deletion_job_from(row: &Row) -> DeletionJobRow {
+    DeletionJobRow {
+        id: row.get::<String>("id").unwrap_or_default(),
+        provider: row.get::<String>("provider").unwrap_or_default(),
+        provider_subject: row.get::<String>("provider_subject").unwrap_or_default(),
+        confirmation_code: row.get::<String>("confirmation_code").unwrap_or_default(),
+        status: row.get::<String>("status").unwrap_or_default(),
+        outcome: row.get::<String>("outcome"),
+        created_at: row.get::<String>("created_at").unwrap_or_default(),
+        completed_at: row.get::<String>("completed_at"),
+    }
+}
+
+fn select_deletion_jobs() -> sea_query::SelectStatement {
+    Query::select()
+        .columns([
+            iden("id"),
+            iden("provider"),
+            iden("provider_subject"),
+            iden("confirmation_code"),
+            iden("status"),
+            iden("outcome"),
+            iden("created_at"),
+            iden("completed_at"),
+        ])
+        .from(iden("deletion_jobs"))
+        .to_owned()
+}
+
+/// Records a deletion request.
+///
+/// # Errors
+///
+/// [`DbError::Execute`] when the statement fails, including the unique
+/// constraint on `confirmation_code`.
+pub async fn insert_deletion_job(db: &dyn Database, row: &DeletionJobRow) -> Result<(), DbError> {
+    let mut insert = Query::insert();
+    insert
+        .into_table(iden("deletion_jobs"))
+        .columns([
+            iden("id"),
+            iden("provider"),
+            iden("provider_subject"),
+            iden("confirmation_code"),
+            iden("status"),
+            iden("outcome"),
+            iden("created_at"),
+            iden("completed_at"),
+        ])
+        .values_panic([
+            row.id.clone().into(),
+            row.provider.clone().into(),
+            row.provider_subject.clone().into(),
+            row.confirmation_code.clone().into(),
+            row.status.clone().into(),
+            row.outcome.clone().into(),
+            row.created_at.clone().into(),
+            row.completed_at.clone().into(),
+        ]);
+    db.execute(&Statement::render(&insert)).await?;
+    Ok(())
+}
+
+/// The job a confirmation code names, for the status page.
+///
+/// # Errors
+///
+/// [`DbError::Query`] when the statement fails.
+pub async fn deletion_job_by_code(
+    db: &dyn Database,
+    confirmation_code: &str,
+) -> Result<Option<DeletionJobRow>, DbError> {
+    let query = select_deletion_jobs()
+        .and_where(Expr::col(iden("confirmation_code")).eq(confirmation_code))
+        .limit(1)
+        .to_owned();
+    let rows = db.query(&Statement::render(&query)).await?;
+    Ok(rows.first().map(deletion_job_from))
+}
+
+/// Pending jobs, oldest first, for the scheduled handler.
+///
+/// # Errors
+///
+/// [`DbError::Query`] when the statement fails.
+pub async fn pending_deletion_jobs(
+    db: &dyn Database,
+    limit: u64,
+) -> Result<Vec<DeletionJobRow>, DbError> {
+    let query = select_deletion_jobs()
+        .and_where(Expr::col(iden("status")).eq(DELETION_PENDING))
+        .order_by(iden("created_at"), sea_query::Order::Asc)
+        .limit(limit)
+        .to_owned();
+    let rows = db.query(&Statement::render(&query)).await?;
+    Ok(rows.rows.iter().map(deletion_job_from).collect())
+}
+
+/// Marks a job done and records what it did.
+///
+/// # Errors
+///
+/// [`DbError::Execute`] when the statement fails.
+pub async fn complete_deletion_job(
+    db: &dyn Database,
+    id: &str,
+    outcome: &str,
+    completed_at: &str,
+) -> Result<u64, DbError> {
+    let mut update = Query::update();
+    update
+        .table(iden("deletion_jobs"))
+        .values([
+            (iden("status"), DELETION_DONE.into()),
+            (iden("outcome"), outcome.into()),
+            (iden("completed_at"), completed_at.into()),
+        ])
+        .and_where(Expr::col(iden("id")).eq(id))
+        // Only a pending job completes. Two schedulers racing the same row
+        // would otherwise both do the work and both report success.
+        .and_where(Expr::col(iden("status")).eq(DELETION_PENDING));
+    db.execute(&Statement::render(&update)).await
+}
+
+/// Removes a user and everything that points at them.
+///
+/// `delete_user` alone cannot do this: `identities`, `credentials` and
+/// `sessions` all carry `user_id TEXT NOT NULL REFERENCES users(id)` with
+/// no cascade, so deleting the user first fails the constraint. Revoking
+/// sessions is not deleting them either — a revoked row is still a row,
+/// and this is an erasure.
+///
+/// The order is the foreign keys' order, children first. `single_use_tokens`
+/// has no constraint but does carry `user_id`, and a half-spent magic link
+/// is the person's data as much as anything else.
+///
+/// **This function is part of the schema.** A table that gains a `user_id`
+/// and is not added here leaves rows behind that an erasure was supposed to
+/// remove, and nothing will fail to say so.
+///
+/// # Errors
+///
+/// [`DbError::Execute`] when any statement fails. Not a transaction: the
+/// `Database` port has none that spans statements, so a failure part-way
+/// leaves the rows it already removed removed. The caller retries, and the
+/// retry is harmless because every step is a delete.
+pub async fn purge_user(db: &dyn Database, user_id: &str) -> Result<u64, DbError> {
+    let mut removed = 0;
+    for table in ["single_use_tokens", "sessions", "credentials", "identities"] {
+        let mut delete = Query::delete();
+        delete
+            .from_table(iden(table))
+            .and_where(Expr::col(iden("user_id")).eq(user_id));
+        removed += db.execute(&Statement::render(&delete)).await?;
+    }
+    removed += delete_user(db, user_id).await?;
+    Ok(removed)
+}

@@ -25,21 +25,34 @@ use oauth2::{
 use serde::Deserialize;
 use std::sync::Arc;
 
+use crate::deletion;
 use crate::flow::{self, Flow};
 use crate::graph::{self, PortHttpClient};
 use crate::session::{self, Completed};
+use crate::signed_request;
 use crate::{CALLBACK_REFUSED, META_UNAVAILABLE, ModuleState, SCOPES, Settings};
 
 /// 32 bytes each for the state and the PKCE verifier.
 const RANDOM_BYTES: usize = 32;
 
 /// A `return_to` longer than this is not a path anyone meant.
-const MAX_RETURN_TO: usize = 512;
+///
+/// Bigger than it looks it needs to be, deliberately. The login chooser
+/// sends the whole pending `/authorize` here, and `/authorize` accepts a
+/// client `state` of up to 2048 bytes on its own. At 512 a client with a
+/// long state silently landed back on `/` with its authorization request
+/// gone, and nothing anywhere said so.
+const MAX_RETURN_TO: usize = 4096;
 
 pub(crate) fn router() -> axum::Router<Arc<ModuleState>> {
     axum::Router::new()
         .route("/start", get(start))
         .route("/callback", get(callback))
+        // Meta posts here directly (#18). Not started by a person, not
+        // guarded by a cookie: the HMAC is the only thing that makes a
+        // request Meta's.
+        .route("/data-deletion", axum::routing::post(data_deletion))
+        .route("/deletion-status", get(deletion_status))
 }
 
 #[derive(Debug, Deserialize)]
@@ -427,7 +440,23 @@ mod tests {
             assert_eq!(safe_return_to(Some(bad)), None, "{bad} was accepted");
         }
         assert_eq!(safe_return_to(None), None);
-        assert_eq!(safe_return_to(Some(&format!("/{}", "a".repeat(600)))), None);
+        assert_eq!(
+            safe_return_to(Some(&format!("/{}", "a".repeat(MAX_RETURN_TO)))),
+            None
+        );
+        // But a maximal `/authorize` must fit, or the login chooser sends a
+        // `return_to` this silently drops and the person lands on `/` with
+        // their authorization request gone. `state` alone may be 2048.
+        let pending = format!(
+            "/v1/auth-core/authorize?response_type=code&client_id=c&redirect_uri=https%3A%2F%2Fapp.example%2Fcb\
+             &code_challenge={}&code_challenge_method=S256&state={}",
+            "c".repeat(43),
+            "s".repeat(2048)
+        );
+        assert!(
+            safe_return_to(Some(&pending)).is_some(),
+            "a maximal /authorize does not fit in {MAX_RETURN_TO} bytes"
+        );
         assert_eq!(safe_return_to(Some("/ok\nSet-Cookie: x")), None);
     }
 
@@ -442,4 +471,133 @@ mod tests {
                 .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
         );
     }
+}
+
+// ---------------------------------------------------------------------
+// Data deletion (issue #18)
+
+/// Meta posts `signed_request` as a form field.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct DeletionBody {
+    signed_request: Option<String>,
+}
+
+/// `POST /data-deletion`.
+///
+/// The one endpoint here nobody's browser starts. Every refusal answers
+/// `400` with the same body, because a caller who can tell "wrong
+/// signature" from "no such user" learns whether a given person has an
+/// account, and this endpoint is unauthenticated by definition.
+async fn data_deletion(
+    State(state): State<Arc<ModuleState>>,
+    scope: Scope,
+    headers: HeaderMap,
+    body: String,
+) -> Result<Response, Problem> {
+    if let Some(limited) = limit(&state, &headers).await {
+        return Ok(limited);
+    }
+    let settings = state.settings()?;
+    let ctx = state.ctx.as_ref();
+    let (Some(db), Some(clock), Some(id_gen)) = (
+        ctx.ports.db.as_deref(),
+        ctx.ports.clock.as_deref(),
+        ctx.ports.id_gen.as_deref(),
+    ) else {
+        return Err(Problem::not_ready("auth-meta needs its ports"));
+    };
+
+    // Parsed by hand rather than through the `Form` extractor so the
+    // refusal is ours and identical for every cause. Meta also sends it
+    // as JSON in some integrations, so both are accepted.
+    let signed = form_field(&body, "signed_request")
+        .or_else(|| {
+            serde_json::from_str::<DeletionBody>(&body)
+                .ok()
+                .and_then(|parsed| parsed.signed_request)
+        })
+        .unwrap_or_default();
+
+    let request = match signed_request::verify(&signed, &settings.client_secret) {
+        Ok(request) => request,
+        Err(err) => {
+            // Logged with the reason, answered without it.
+            tracing::warn!(error = %err, "a data deletion callback did not verify");
+            return Err(Problem::new(&CALLBACK_REFUSED).instance(&scope.request_id));
+        }
+    };
+    if let Some(issued_at) = request.issued_at {
+        tracing::info!(issued_at, "a verified data deletion request arrived");
+    }
+
+    let code = deletion::record(db, clock, id_gen, &request.user_id)
+        .await
+        .map_err(|err| {
+            tracing::error!(error = %err, "could not record a deletion request");
+            Problem::internal().instance(&scope.request_id)
+        })?;
+
+    // The shape Meta requires: where a person can check, and the code that
+    // identifies their request.
+    Ok(axum::Json(serde_json::json!({
+        "url": format!(
+            "{}/v1/auth-meta/deletion-status?code={}",
+            settings.redirect_base.trim_end_matches('/'),
+            code
+        ),
+        "confirmation_code": code,
+    }))
+    .into_response())
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct StatusQuery {
+    code: Option<String>,
+}
+
+/// `GET /deletion-status?code=…`, the page Meta's answer points at.
+///
+/// Says pending or done and nothing else. It carries no name, no address
+/// and no account id: the code is unguessable, but a status page that
+/// described the account would turn one leaked URL into a disclosure.
+async fn deletion_status(
+    State(state): State<Arc<ModuleState>>,
+    Query(query): Query<StatusQuery>,
+) -> Result<Response, Problem> {
+    let ctx = state.ctx.as_ref();
+    let Some(db) = ctx.ports.db.as_deref() else {
+        return Err(Problem::not_ready("auth-meta needs a database"));
+    };
+    let code = query.code.unwrap_or_default();
+    let job = if code.is_empty() {
+        None
+    } else {
+        factory0_auth_core::deletion_job_by_code(db, &code)
+            .await
+            .ok()
+            .flatten()
+    };
+
+    // An unknown code and a missing one answer the same way, so the page
+    // cannot be used to test whether a code is real.
+    let Some(job) = job else {
+        return Ok(page(
+            StatusCode::NOT_FOUND,
+            "No deletion request matches that code.",
+        ));
+    };
+    let message = if job.status == factory0_auth_core::DELETION_DONE {
+        "Your deletion request has been carried out."
+    } else {
+        "Your deletion request has been received and is being carried out."
+    };
+    Ok(page(StatusCode::OK, message))
+}
+
+/// One field out of a form-encoded body, without a dependency.
+fn form_field(body: &str, name: &str) -> Option<String> {
+    url::form_urlencoded::parse(body.as_bytes())
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.to_string())
+        .filter(|value| !value.is_empty())
 }

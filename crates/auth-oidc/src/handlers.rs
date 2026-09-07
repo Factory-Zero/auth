@@ -39,7 +39,13 @@ use crate::{CALLBACK_REFUSED, ModuleState, PROVIDER_UNAVAILABLE};
 const RANDOM_BYTES: usize = 32;
 
 /// A `return_to` longer than this is not a path anyone meant.
-const MAX_RETURN_TO: usize = 512;
+///
+/// Bigger than it looks it needs to be, deliberately. The login chooser
+/// sends the whole pending `/authorize` here, and `/authorize` accepts a
+/// client `state` of up to 2048 bytes on its own. At 512 a client with a
+/// long state silently landed back on `/` with its authorization request
+/// gone, and nothing anywhere said so.
+const MAX_RETURN_TO: usize = 4096;
 
 pub(crate) fn router() -> axum::Router<Arc<ModuleState>> {
     axum::Router::new()
@@ -622,7 +628,23 @@ mod tests {
             assert_eq!(safe_return_to(Some(bad)), None, "{bad} was accepted");
         }
         assert_eq!(safe_return_to(None), None);
-        assert_eq!(safe_return_to(Some(&format!("/{}", "a".repeat(600)))), None);
+        assert_eq!(
+            safe_return_to(Some(&format!("/{}", "a".repeat(MAX_RETURN_TO)))),
+            None
+        );
+        // But a maximal `/authorize` must fit, or the login chooser sends a
+        // `return_to` this silently drops and the person lands on `/` with
+        // their authorization request gone. `state` alone may be 2048.
+        let pending = format!(
+            "/v1/auth-core/authorize?response_type=code&client_id=c&redirect_uri=https%3A%2F%2Fapp.example%2Fcb\
+             &code_challenge={}&code_challenge_method=S256&state={}",
+            "c".repeat(43),
+            "s".repeat(2048)
+        );
+        assert!(
+            safe_return_to(Some(&pending)).is_some(),
+            "a maximal /authorize does not fit in {MAX_RETURN_TO} bytes"
+        );
         assert_eq!(safe_return_to(Some("/ok\nSet-Cookie: x")), None);
     }
 

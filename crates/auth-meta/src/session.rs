@@ -36,12 +36,19 @@ pub(crate) async fn complete(
     profile: &crate::graph::Profile,
     caller: &Caller<'_>,
 ) -> Result<Completed, Problem> {
+    // Normalised before the rules see it. `store::user_by_primary_email`
+    // matches exactly and `federated::complete` documents its input as
+    // already normalised, so `Ada@Example.com` would otherwise miss an
+    // existing `ada@example.com` and quietly make a second account whose
+    // address no normalised lookup will ever find again.
+    let email = profile.email.as_deref().map(factory0_core::normalize_email);
+
     let outcome = federated::complete(
         ports,
         &FederatedIdentity {
             provider: PROVIDER,
             subject: &profile.id,
-            email: profile.email.as_deref(),
+            email: email.as_deref(),
             // Never true. Meta does not assert verification in a form this
             // service can rely on, and an address stored as verified is a
             // key: the linking rules auto-link on a verified match, so
@@ -53,11 +60,20 @@ pub(crate) async fn complete(
         caller,
         &AMR,
     )
-    .await
-    .map_err(|err| match err {
+    .await;
+
+    // An auto-link is written before the account's status is read, so
+    // it must be announced even when the sign-in is then refused:
+    // otherwise an identity row appears on somebody's account and
+    // nobody is told, which is the worst of both.
+    if let Err(CompleteError::NotActive(Some(auto))) = &outcome {
+        emit_auto_linked(ctx, scope, &auto.user_id, &auto.notify_email);
+    }
+
+    let outcome = outcome.map_err(|err| match err {
         // The account exists but is switched off. Same answer as any other
         // refused callback: it is not a caller's business which.
-        CompleteError::NotActive => {
+        CompleteError::NotActive(_) => {
             Problem::new(&crate::CALLBACK_REFUSED).instance(&scope.request_id)
         }
         CompleteError::Internal(message) => {
@@ -72,15 +88,7 @@ pub(crate) async fn complete(
     };
 
     if let Some(notify_email) = &signed_in.auto_linked_notify {
-        ctx.events.emit_in(
-            scope,
-            EVENT_AUTO_LINKED,
-            json!({
-                "user_id": signed_in.user_id,
-                "provider": PROVIDER,
-                "notify_email": notify_email,
-            }),
-        );
+        emit_auto_linked(ctx, scope, &signed_in.user_id, notify_email);
     }
     ctx.events.emit_in(
         scope,
@@ -95,6 +103,22 @@ pub(crate) async fn complete(
     Ok(Completed::SignedIn {
         session: signed_in.session,
     })
+}
+
+/// Announces that an account gained a way in. Called from both paths: the
+/// link is written before the account's status is read, so a refused
+/// sign-in can still have created one.
+fn emit_auto_linked(ctx: &ModuleContext, scope: &Scope, user_id: &str, notify_email: &str) {
+    // Sending the mail is not this module's job; saying it happened is.
+    ctx.events.emit_in(
+        scope,
+        EVENT_AUTO_LINKED,
+        json!({
+            "user_id": user_id,
+            "provider": PROVIDER,
+            "notify_email": notify_email,
+        }),
+    );
 }
 
 /// The `Set-Cookie` value for an issued session.

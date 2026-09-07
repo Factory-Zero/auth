@@ -28,10 +28,12 @@
 
 #![forbid(unsafe_code)]
 
+mod deletion;
 mod flow;
 mod graph;
 mod handlers;
 mod session;
+mod signed_request;
 
 use factory0_core::{
     Config, ConfigError, Migrations, Module, ModuleConfig, ModuleContext, Port, Problem, ProblemDef,
@@ -250,6 +252,17 @@ impl Module for Meta {
 
     fn migrations(&self) -> Migrations {
         Migrations::EMPTY
+    }
+
+    /// Drains the deletion queue (#18). The callback records a job and
+    /// answers; this is where the work happens, so a slow or failing
+    /// deletion cannot make Meta's callback time out.
+    fn scheduled<'a>(
+        &'a self,
+        ctx: &'a ModuleContext,
+        cron: &'a str,
+    ) -> factory0_core::BoxFuture<'a, Result<(), factory0_core::AnyError>> {
+        Box::pin(deletion::run_pending(ctx, cron))
     }
 
     fn validate_config(&self, cfg: &dyn Config) -> Result<(), ConfigError> {

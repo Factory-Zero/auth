@@ -29,6 +29,8 @@ getrandom = { workspace = true }
 url = { workspace = true }
 thiserror = { workspace = true }
 oauth2 = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
 factory0-testing = { workspace = true }

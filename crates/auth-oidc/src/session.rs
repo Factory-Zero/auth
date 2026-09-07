@@ -91,11 +91,20 @@ pub(crate) async fn complete(
         },
         &AMR,
     )
-    .await
-    .map_err(|err| match err {
+    .await;
+
+    // An auto-link is written before the account's status is read, so
+    // it must be announced even when the sign-in is then refused:
+    // otherwise an identity row appears on somebody's account and
+    // nobody is told, which is the worst of both.
+    if let Err(CompleteError::NotActive(Some(auto))) = &outcome {
+        emit_auto_linked(ctx, scope, provider.slug, &auto.user_id, &auto.notify_email);
+    }
+
+    let outcome = outcome.map_err(|err| match err {
         // The account exists but is switched off. Same answer as any other
         // refused callback: it is not a caller's business which.
-        CompleteError::NotActive => {
+        CompleteError::NotActive(_) => {
             Problem::new(&crate::CALLBACK_REFUSED).instance(&scope.request_id)
         }
         CompleteError::Internal(message) => {
@@ -112,17 +121,7 @@ pub(crate) async fn complete(
     // The events are this module's, because their names are and because
     // `emits()` declares them. auth-core did the work; saying so is ours.
     if let Some(notify_email) = &signed_in.auto_linked_notify {
-        // The account just gained a way in, so somebody has to be told.
-        // Sending the mail is not this module's job; saying it happened is.
-        ctx.events.emit_in(
-            scope,
-            EVENT_AUTO_LINKED,
-            json!({
-                "user_id": signed_in.user_id,
-                "provider": provider.slug,
-                "notify_email": notify_email,
-            }),
-        );
+        emit_auto_linked(ctx, scope, provider.slug, &signed_in.user_id, notify_email);
     }
     ctx.events.emit_in(
         scope,
@@ -137,6 +136,28 @@ pub(crate) async fn complete(
     Ok(Completed::SignedIn {
         session: signed_in.session,
     })
+}
+
+/// Announces that an account gained a way in. Called from both paths: the
+/// link is written before the account's status is read, so a refused
+/// sign-in can still have created one.
+fn emit_auto_linked(
+    ctx: &ModuleContext,
+    scope: &Scope,
+    provider: &str,
+    user_id: &str,
+    notify_email: &str,
+) {
+    // Sending the mail is not this module's job; saying it happened is.
+    ctx.events.emit_in(
+        scope,
+        EVENT_AUTO_LINKED,
+        json!({
+            "user_id": user_id,
+            "provider": provider,
+            "notify_email": notify_email,
+        }),
+    );
 }
 
 /// The `Set-Cookie` value for an issued session.

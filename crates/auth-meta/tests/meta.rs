@@ -150,6 +150,8 @@ struct Kit {
     harness: TestHarness,
     meta: FakeMeta,
     clock: Arc<TestClock>,
+    /// The same clock, typed as the port, for building a scheduled context.
+    clock_port: Arc<dyn Clock>,
     db: Arc<dyn Database>,
     id_gen: Arc<dyn IdGen>,
 }
@@ -188,6 +190,7 @@ fn kit_with(pairs: Vec<(String, String)>) -> Kit {
     Kit {
         harness,
         meta,
+        clock_port: clock.clone(),
         clock,
         db,
         id_gen: Arc::new(UlidIdGen),
@@ -463,6 +466,54 @@ fn an_existing_account_on_the_same_address_is_not_taken_over() {
     });
 }
 
+/// Meta sends the address as the person typed it. Un-normalised, it misses
+/// an existing account and quietly makes a second one whose address no
+/// normalised lookup will ever match again.
+#[test]
+fn a_differently_cased_address_is_not_a_second_account() {
+    pollster::block_on(async {
+        let kit = kit();
+        let existing = kit.id_gen.ulid();
+        insert_user(
+            &*kit.db,
+            &UserRow {
+                id: existing,
+                display_name: None,
+                primary_email: Some("ada@example.com".to_owned()),
+                primary_email_verified: true,
+                status: "active".to_owned(),
+                created_at: "2026-09-07T10:00:00Z".to_owned(),
+                updated_at: "2026-09-07T10:00:00Z".to_owned(),
+            },
+        )
+        .await
+        .expect("seeds");
+
+        kit.meta.set_profile(json!({
+            "id": "meta-subject-1",
+            "email": "Ada@Example.COM",
+        }));
+
+        let started = start(&kit, &[]).await;
+        let response = get(
+            &kit,
+            &format!("{CALLBACK}?code=meta-code&state={}", started.state),
+            &[("__Host-fz_meta", &started.flow_cookie)],
+        )
+        .await;
+
+        // The same refusal a matching-case address gets: the rules will not
+        // guess, and there is exactly one account.
+        assert_eq!(response.status, StatusCode::OK, "{}", response.text());
+        assert!(response.cookie("__Host-fz_session").is_none());
+        assert_eq!(
+            count(&kit, "users"),
+            1,
+            "a differently cased address made a second account"
+        );
+    });
+}
+
 /// An email is a permission a person can decline, and declining it must
 /// still sign them in.
 #[test]
@@ -714,5 +765,318 @@ fn a_disabled_account_gets_no_session() {
             response.cookie("__Host-fz_session").is_none(),
             "a disabled account was issued a session"
         );
+    });
+}
+
+// ---------------------------------------------------------------------
+// Data deletion (issue #18)
+
+use base64ct::{Base64UrlUnpadded, Encoding as _};
+use hmac::{KeyInit, Mac, SimpleHmac};
+use sha2::Sha256;
+
+const DELETION: &str = "/v1/auth-meta/data-deletion";
+const STATUS: &str = "/v1/auth-meta/deletion-status";
+
+/// Builds a `signed_request` the way Meta does.
+fn signed_request(user_id: &str, secret: &str) -> String {
+    let payload = json!({
+        "algorithm": "HMAC-SHA256",
+        "issued_at": 1_788_775_200,
+        "user_id": user_id,
+    });
+    let payload_b64 =
+        Base64UrlUnpadded::encode_string(&serde_json::to_vec(&payload).expect("json"));
+    let mut mac =
+        <SimpleHmac<Sha256> as KeyInit>::new_from_slice(secret.as_bytes()).expect("any key");
+    mac.update(payload_b64.as_bytes());
+    let signature = Base64UrlUnpadded::encode_string(&mac.finalize().into_bytes());
+    format!("{signature}.{payload_b64}")
+}
+
+async fn post_form(kit: &Kit, uri: &str, body: &str) -> Res {
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from(body.to_owned()))
+        .expect("request");
+    let response = kit
+        .harness
+        .router
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("router answers");
+    let (parts, body) = response.into_parts();
+    let body = axum::body::to_bytes(body, 1024 * 1024)
+        .await
+        .expect("body reads");
+    Res {
+        status: parts.status,
+        headers: parts.headers,
+        body: body.to_vec(),
+    }
+}
+
+/// Signs somebody in with Meta so there is something to delete.
+async fn sign_in(kit: &Kit, subject: &str) {
+    kit.meta
+        .set_profile(json!({ "id": subject, "name": "Ada" }));
+    let started = start(kit, &[]).await;
+    let response = get(
+        kit,
+        &format!("{CALLBACK}?code=meta-code&state={}", started.state),
+        &[("__Host-fz_meta", &started.flow_cookie)],
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::FOUND, "{}", response.text());
+}
+
+/// Runs the module's scheduled handler, which is what drains the queue.
+/// The callback only records; nothing is deleted until this runs.
+fn run_jobs(kit: &Kit) {
+    let mut ports = factory0_core::Ports::empty();
+    ports.db = Some(kit.db.clone());
+    ports.clock = Some(kit.clock_port.clone());
+    ports.id_gen = Some(kit.id_gen.clone());
+
+    let module = kit
+        .harness
+        .modules
+        .iter()
+        .find(|module| module.name() == "auth-meta")
+        .expect("auth-meta is mounted")
+        .clone();
+    let ctx = kit.harness.harness.module_context(module.as_ref(), &ports);
+    pollster::block_on(module.scheduled(&ctx, "0 * * * *")).expect("scheduled run");
+}
+
+#[test]
+fn a_signed_deletion_request_is_recorded_and_answered_the_way_meta_requires() {
+    pollster::block_on(async {
+        let kit = kit();
+        sign_in(&kit, "meta-subject-1").await;
+
+        let body = format!(
+            "signed_request={}",
+            signed_request("meta-subject-1", "the-app-secret")
+        );
+        let response = post_form(&kit, DELETION, &body).await;
+        assert_eq!(response.status, StatusCode::OK, "{}", response.text());
+
+        let answer: Value = serde_json::from_slice(&response.body).expect("json");
+        let code = answer["confirmation_code"].as_str().expect("a code");
+        assert!(!code.is_empty());
+        // Meta requires a URL a person can visit, and it must point at us.
+        let url = answer["url"].as_str().expect("a url");
+        assert!(url.starts_with(REDIRECT_BASE), "{url}");
+        assert!(url.contains(code), "the url must name the request: {url}");
+
+        // Recorded, not carried out: the identity is still there.
+        assert_eq!(count(&kit, "identities"), 1);
+        assert_eq!(count(&kit, "deletion_jobs"), 1);
+    });
+}
+
+#[test]
+fn an_unsigned_or_wrongly_signed_request_deletes_nothing() {
+    pollster::block_on(async {
+        let kit = kit();
+        sign_in(&kit, "meta-subject-1").await;
+
+        for body in [
+            String::new(),
+            "signed_request=".to_owned(),
+            "signed_request=rubbish".to_owned(),
+            // Correctly shaped, signed with somebody else's secret.
+            format!(
+                "signed_request={}",
+                signed_request("meta-subject-1", "not-the-app-secret")
+            ),
+        ] {
+            let response = post_form(&kit, DELETION, &body).await;
+            assert_eq!(response.status, StatusCode::BAD_REQUEST, "{body:?}");
+        }
+        assert_eq!(
+            count(&kit, "deletion_jobs"),
+            0,
+            "an unverified request queued work"
+        );
+        assert_eq!(count(&kit, "identities"), 1);
+    });
+}
+
+/// The first branch of ADR 0104: Meta was the only way in, so the account
+/// goes with it.
+#[test]
+fn a_job_deletes_the_account_when_meta_was_the_only_way_in() {
+    pollster::block_on(async {
+        let kit = kit();
+        sign_in(&kit, "meta-subject-1").await;
+        assert_eq!(count(&kit, "users"), 1);
+        assert_eq!(count(&kit, "sessions"), 1);
+
+        let body = format!(
+            "signed_request={}",
+            signed_request("meta-subject-1", "the-app-secret")
+        );
+        let answer: Value =
+            serde_json::from_slice(&post_form(&kit, DELETION, &body).await.body).expect("json");
+        let code = answer["confirmation_code"]
+            .as_str()
+            .expect("code")
+            .to_owned();
+
+        run_jobs(&kit);
+
+        assert_eq!(count(&kit, "identities"), 0);
+        assert_eq!(count(&kit, "users"), 0, "the account should be gone");
+        let status = get(&kit, &format!("{STATUS}?code={code}"), &[]).await;
+        assert_eq!(status.status, StatusCode::OK);
+        assert!(
+            status.text().contains("has been carried out"),
+            "{}",
+            status.text()
+        );
+    });
+}
+
+/// The second branch: another way in remains, so the account stays and only
+/// Meta's identity goes.
+#[test]
+fn a_job_only_unlinks_when_the_account_has_another_way_in() {
+    pollster::block_on(async {
+        let kit = kit();
+        sign_in(&kit, "meta-subject-1").await;
+
+        let identity = identity_by_provider_subject(&*kit.db, "meta", "meta-subject-1")
+            .await
+            .expect("query")
+            .expect("an identity");
+        // A second identity on the same account: a Google sign-in they
+        // also use. Meta's request must not take it with them.
+        factory0_auth_core::insert_identity(
+            &*kit.db,
+            &factory0_auth_core::IdentityRow {
+                id: kit.id_gen.ulid(),
+                user_id: identity.user_id.clone(),
+                provider: "google".to_owned(),
+                provider_subject: "google-subject-1".to_owned(),
+                email: Some("ada@example.com".to_owned()),
+                email_verified: true,
+                name_at_link: None,
+                created_at: "2026-09-07T10:00:00Z".to_owned(),
+                last_login_at: None,
+            },
+        )
+        .await
+        .expect("seeds");
+
+        let body = format!(
+            "signed_request={}",
+            signed_request("meta-subject-1", "the-app-secret")
+        );
+        let _ = post_form(&kit, DELETION, &body).await;
+        run_jobs(&kit);
+
+        assert_eq!(count(&kit, "users"), 1, "the account was taken too");
+        assert_eq!(count(&kit, "identities"), 1, "only Meta's should go");
+        assert!(
+            identity_by_provider_subject(&*kit.db, "meta", "meta-subject-1")
+                .await
+                .expect("query")
+                .is_none(),
+            "Meta's identity survived"
+        );
+        assert!(
+            identity_by_provider_subject(&*kit.db, "google", "google-subject-1")
+                .await
+                .expect("query")
+                .is_some(),
+            "the other provider's identity was deleted"
+        );
+    });
+}
+
+/// Idempotent: a replayed or retried request is not an error, which is what
+/// makes not checking `issued_at` safe.
+#[test]
+fn running_a_job_twice_and_deleting_an_unknown_subject_are_both_harmless() {
+    pollster::block_on(async {
+        let kit = kit();
+        sign_in(&kit, "meta-subject-1").await;
+
+        let body = format!(
+            "signed_request={}",
+            signed_request("meta-subject-1", "the-app-secret")
+        );
+        let _ = post_form(&kit, DELETION, &body).await;
+        run_jobs(&kit);
+        assert_eq!(count(&kit, "users"), 0);
+
+        // The same request again, after everything is already gone.
+        let response = post_form(&kit, DELETION, &body).await;
+        assert_eq!(response.status, StatusCode::OK);
+        run_jobs(&kit);
+        assert_eq!(count(&kit, "users"), 0);
+
+        // And a subject that never existed.
+        let unknown = format!(
+            "signed_request={}",
+            signed_request("never-heard-of-them", "the-app-secret")
+        );
+        assert_eq!(
+            post_form(&kit, DELETION, &unknown).await.status,
+            StatusCode::OK
+        );
+        run_jobs(&kit);
+
+        // Every job closed, none left pending.
+        let rows = kit
+            .db
+            .query(&factory0_core::Statement::new(
+                "SELECT COUNT(*) AS n FROM deletion_jobs WHERE status = 'pending'",
+            ))
+            .await
+            .expect("query");
+        assert_eq!(
+            rows.first().and_then(|row| row.get::<i64>("n")),
+            Some(0),
+            "a job was left pending"
+        );
+    });
+}
+
+#[test]
+fn the_status_page_says_nothing_about_the_account() {
+    pollster::block_on(async {
+        let kit = kit();
+        sign_in(&kit, "meta-subject-1").await;
+        let body = format!(
+            "signed_request={}",
+            signed_request("meta-subject-1", "the-app-secret")
+        );
+        let answer: Value =
+            serde_json::from_slice(&post_form(&kit, DELETION, &body).await.body).expect("json");
+        let code = answer["confirmation_code"]
+            .as_str()
+            .expect("code")
+            .to_owned();
+
+        let status = get(&kit, &format!("{STATUS}?code={code}"), &[]).await;
+        assert_eq!(status.status, StatusCode::OK);
+        let text = status.text();
+        // A leaked URL must not become a disclosure.
+        assert!(!text.contains("meta-subject-1"), "{text}");
+        assert!(!text.contains("Ada"), "{text}");
+
+        // An unknown code and a missing one answer identically, so the page
+        // cannot be used to test whether a code is real.
+        let unknown = get(&kit, &format!("{STATUS}?code=not-a-real-code"), &[]).await;
+        let missing = get(&kit, STATUS, &[]).await;
+        assert_eq!(unknown.status, StatusCode::NOT_FOUND);
+        assert_eq!(missing.status, StatusCode::NOT_FOUND);
+        assert_eq!(unknown.text(), missing.text());
     });
 }

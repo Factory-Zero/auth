@@ -73,14 +73,30 @@ pub enum Completed {
     },
 }
 
+/// An account that gained a way in, whether or not a session followed.
+///
+/// The link is written before the account's status is read, so this is
+/// returned on the refusal path as well as the success one: the caller
+/// announces it either way.
+#[derive(Debug, Clone)]
+pub struct AutoLinked {
+    pub user_id: String,
+    pub notify_email: String,
+}
+
 /// Why a login could not be completed.
 #[derive(Debug, thiserror::Error)]
 pub enum CompleteError {
     /// The account exists and is switched off. Callers answer this the
     /// same way they answer any other refused callback: which one it was
     /// is not a caller's business.
+    ///
+    /// Carries the auto-link when the rules made one, because the link is
+    /// written before the account's status is read: without this, an
+    /// identity row appears on somebody's account and nobody is told,
+    /// which is the worst of both.
     #[error("the account is not active")]
-    NotActive,
+    NotActive(Option<Box<AutoLinked>>),
     /// The database, or a rule, failed in a way nobody can act on.
     #[error("{0}")]
     Internal(String),
@@ -187,7 +203,12 @@ pub async fn complete(
     .map_err(|err| match err {
         SessionError::NotActive => {
             tracing::warn!(user = %user_id, "a disabled account signed in through a provider");
-            CompleteError::NotActive
+            CompleteError::NotActive(auto_linked_notify.as_ref().map(|notify_email| {
+                Box::new(AutoLinked {
+                    user_id: user_id.clone(),
+                    notify_email: notify_email.clone(),
+                })
+            }))
         }
         err => CompleteError::Internal(format!("could not issue a session: {err}")),
     })?;
