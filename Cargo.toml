@@ -93,6 +93,11 @@ openidconnect = { version = "4.0.1", default-features = false, features = [
     "accept-string-booleans",
 ] }
 chrono = { version = "0.4", default-features = false, features = ["alloc"] }
+# Facebook Login is OAuth 2.0 without OpenID Connect: no ID token, no
+# discovery document, and the profile comes from a Graph call. So Meta
+# (#17) uses `oauth2` directly, which is the crate `openidconnect` is
+# built on and is already in the tree.
+oauth2 = { version = "5.0.0", default-features = false }
 
 # Traits and errors.
 async-trait = "0.1.92"

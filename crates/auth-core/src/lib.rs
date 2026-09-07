@@ -24,6 +24,7 @@
 
 mod authorize;
 mod clients;
+pub mod federated;
 pub mod linking;
 mod secrets;
 mod sessions;

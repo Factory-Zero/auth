@@ -1,0 +1,39 @@
+[package]
+name = "factory0-auth-meta"
+description = "Facebook Login for the Factory Zero auth service: OAuth 2.0 plus a Graph profile call, with no OpenID Connect anywhere (issue #17)"
+readme = "README.md"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+factory0-core = { workspace = true }
+# auth-core owns the schema, the linking rules and the step that turns a
+# verified identity into a session; this module adds no tables.
+factory0-auth-core = { path = "../auth-core" }
+axum = { workspace = true }
+http = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true }
+tracing = { workspace = true }
+base64ct = { workspace = true }
+getrandom = { workspace = true }
+url = { workspace = true }
+thiserror = { workspace = true }
+oauth2 = { workspace = true }
+
+[dev-dependencies]
+factory0-testing = { workspace = true }
+factory0-adapter-sqlite = { workspace = true }
+pollster = { workspace = true }
+tower = { workspace = true }
+async-trait = { workspace = true }
+url = { workspace = true }

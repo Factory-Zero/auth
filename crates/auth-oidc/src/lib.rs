@@ -79,14 +79,6 @@ pub const CALLBACK_REFUSED: ProblemDef = ProblemDef {
 
 pub(crate) const DEFAULT_RETURN_TO: &str = "/";
 
-/// The one timestamp shape this service stores.
-pub(crate) fn iso(at: time::OffsetDateTime) -> String {
-    at.replace_nanosecond(0)
-        .unwrap_or(at)
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_default()
-}
-
 /// One provider's credentials, ready for a request.
 ///
 /// `client_secret` is a resolved string by the time anything holds this:

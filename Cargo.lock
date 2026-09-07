@@ -765,6 +765,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "factory0-auth-meta"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64ct",
+ "bytes",
+ "factory0-adapter-sqlite",
+ "factory0-auth-core",
+ "factory0-core",
+ "factory0-testing",
+ "getrandom 0.4.3",
+ "http",
+ "oauth2",
+ "pollster",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "time",
+ "tower",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "factory0-auth-oidc"
 version = "0.1.0"
 dependencies = [
