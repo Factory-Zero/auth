@@ -56,6 +56,10 @@ pub const CODE_LIFETIME_SECS: i64 = 60;
 const AUTHORIZE_REFUSED_MESSAGE: &str =
     "The sign-in request did not match a registered application.";
 
+/// Where the chooser sends somebody when the request has no path at all,
+/// which a well-formed HTTP request cannot produce.
+const DEFAULT_CHOOSER_RETURN_TO: &str = "/";
+
 /// The config key naming which login methods this deployment offers.
 ///
 /// Explicit rather than sniffed from the other modules' keys. auth-core
@@ -397,7 +401,20 @@ async fn authorize(
     // already stripped, so `Uri` alone would send people to `/authorize`,
     // which does not exist.
     let chooser = || {
-        let return_to = original_uri.to_string();
+        // Path and query, never `to_string()`. On Workers the runtime
+        // builds the request from `req.url()`, so the URI is **absolute**:
+        // `https://auth.example/v1/auth-core/authorize?...`. Every
+        // provider's `safe_return_to` refuses anything not starting with
+        // `/`, so an absolute value is silently replaced by the default
+        // and the person lands on `/` with their authorization request
+        // gone — which is the exact thing this page exists to prevent.
+        // On the native runtime the same URI arrives in origin form, so
+        // the bug only appears in production, which is why the tests were
+        // green. See the test that sends an absolute-form target.
+        let return_to = original_uri.path_and_query().map_or_else(
+            || DEFAULT_CHOOSER_RETURN_TO.to_owned(),
+            |path_and_query| path_and_query.as_str().to_owned(),
+        );
         let methods = enabled_login_methods(&*state.ctx.config, &return_to);
         html(&LoginChooserTemplate {
             has_passkey: methods.iter().any(|method| method.is_passkey),

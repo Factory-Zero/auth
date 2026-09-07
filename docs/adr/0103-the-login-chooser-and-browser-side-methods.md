@@ -63,8 +63,18 @@ Deliberately **not** sniffed from the other modules' config keys
 (`AUTH_OIDC_GOOGLE_CLIENT_ID` and friends). `auth-core` does not depend on the
 login-method crates and should not learn their configuration either; and a
 method whose module is not mounted would otherwise get a button that 404s.
-An unknown slug fails `validate_config`, naming what the chooser does know, so
-a typo is a build failure rather than a dead button.
+An unknown slug fails `validate_config`, naming what the chooser does know.
+
+**With one caveat worth stating rather than implying.** Nothing on the
+production boot path calls `validate_config`: not `Harness::build`, not
+`runtime-cloudflare::serve`, and not `fz doctor`, despite the trait's own
+doc comment saying otherwise. Only the test conformance kit calls it. So a
+typo is caught by `cargo test` and **not** at deploy time, where the slug is
+instead dropped silently by the catalogue lookup. That is fail-safe — nothing
+from configuration can inject a path or markup, and an unknown slug renders
+no button — but it is not the loud failure the check is written to be. Filed
+against the harness; the check stays because it is right, and it becomes
+load-bearing the moment the harness calls it.
 
 The cost is that configuring Google is two settings rather than one. That is
 the right way round: which methods a deployment *offers* is a decision, not a

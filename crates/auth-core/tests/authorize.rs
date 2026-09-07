@@ -508,6 +508,37 @@ async fn the_catalogue_needs_none_of_the_method_crates_mounted() {
     assert!(page.contains("data-method=\"passkey\""), "{page}");
 }
 
+/// The Workers runtime builds the axum request from `req.url()`, so the
+/// request target is **absolute** in production and origin-form in every
+/// test. A `return_to` built from the whole URI is refused by every
+/// provider's `safe_return_to`, which silently substitutes `/` — so the
+/// chooser's whole purpose fails only where nobody is looking.
+#[pollster::test]
+async fn an_absolute_request_target_still_yields_a_path_return_to() {
+    let kit = kit_with_methods(Some("google,apple,meta"));
+    seed_client(&kit).await;
+
+    // Exactly what runtime-cloudflare passes to axum.
+    let absolute = format!("https://auth.factory0.ventures{}", authorize_uri(""));
+    let page = body_of(get(&kit, &absolute, None).await).await;
+
+    assert!(
+        page.contains("Continue with Google"),
+        "not the chooser: {page}"
+    );
+    // The encoded return_to must start with an encoded `/`, not a scheme.
+    assert!(
+        page.contains("return_to=%2Fv1%2Fauth-core%2Fauthorize%3F"),
+        "return_to is not a path: {page}"
+    );
+    assert!(
+        !page.contains("return_to=https%3A"),
+        "an absolute return_to every provider refuses: {page}"
+    );
+    // And it survives the guard it will actually meet.
+    assert!(page.contains("client_id%3D"), "{page}");
+}
+
 /// A slug the chooser does not know is a build failure, not a button
 /// that 404s.
 #[test]

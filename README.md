@@ -66,8 +66,10 @@ Which buttons it offers is configuration, not discovery:
 AUTH_CORE_LOGIN_METHODS=passkey,google,apple,meta
 ```
 
-Order is display order, and an unknown slug fails `validate_config` rather than
-rendering a button that 404s. Setting a provider's credentials does **not** by
+Order is display order. An unknown slug fails `validate_config`, which today
+means `cargo test` catches it: nothing on the production boot path calls that
+check, so at runtime an unknown slug is silently dropped and simply renders no
+button. Setting a provider's credentials does **not** by
 itself put it on the chooser: which methods a deployment offers is a decision.
 
 Redirect-shaped methods are plain links and work with script switched off. A
