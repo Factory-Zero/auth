@@ -142,6 +142,52 @@ pub fn kind_allows_secret(kind: &str) -> bool {
     kind == CLIENT_CONFIDENTIAL
 }
 
+// ---------------------------------------------------------------------------
+// Passwords (issues #19, #20)
+
+/// Hashes a password as an argon2id PHC string.
+///
+/// The same parameters and the same code path as a client secret, on
+/// purpose: ADR 0100 measured one set of parameters on Workers and there
+/// is no reason a password should get weaker ones. Wrapping rather than
+/// duplicating means the ADR's numbers live in exactly one place.
+///
+/// # Errors
+///
+/// [`SecretError`] when the OS entropy source or argon2 fails.
+pub fn hash_password(password: &str) -> Result<String, SecretError> {
+    hash_secret(password)
+}
+
+/// Verifies a password against a stored PHC string, in constant time.
+///
+/// `false` for a malformed or non-argon2id stored value, which is what
+/// makes it safe to call with a dummy hash when no credential exists.
+#[must_use]
+pub fn verify_password(presented: &str, stored_phc: &str) -> bool {
+    verify_secret(presented, stored_phc)
+}
+
+/// Whether a stored hash was written with parameters we no longer use.
+///
+/// Login is the only moment the plaintext is available, so it is the only
+/// moment a hash can be upgraded. A stored hash that cannot be parsed says
+/// `false`: it will fail verification anyway, and rehashing on the strength
+/// of an unreadable value would be guessing.
+#[must_use]
+pub fn password_needs_rehash(stored_phc: &str) -> bool {
+    let Ok(parsed) = PasswordHash::new(stored_phc) else {
+        return false;
+    };
+    if parsed.algorithm.as_str() != Algorithm::Argon2id.as_str() {
+        return true;
+    }
+    let Ok(params) = Params::try_from(&parsed) else {
+        return true;
+    };
+    params.m_cost() != M_COST || params.t_cost() != T_COST || params.p_cost() != P_COST
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

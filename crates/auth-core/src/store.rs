@@ -428,6 +428,15 @@ pub struct CredentialRow {
     /// (issue #14). Set means the credential is refused at login: the
     /// counter going backwards is the one clone signal `WebAuthn` offers.
     pub passkey_suspect_at: Option<String>,
+    /// Failed password attempts in the current window (issue #12).
+    pub failed_attempts: i64,
+    /// When the current failure window began. A count with no window is a
+    /// lifetime total, which locks out anyone who has ever mistyped enough
+    /// times across years.
+    pub failed_window_started_at: Option<String>,
+    /// Set once the count crosses the threshold. Until it passes, even a
+    /// correct password is refused: that is the point.
+    pub locked_until: Option<String>,
 }
 
 fn credential_from(row: &Row) -> CredentialRow {
@@ -445,6 +454,11 @@ fn credential_from(row: &Row) -> CredentialRow {
         created_at: row.get::<String>("created_at").unwrap_or_default(),
         last_used_at: row.get::<Option<String>>("last_used_at").flatten(),
         passkey_suspect_at: row.get::<Option<String>>("passkey_suspect_at").flatten(),
+        failed_attempts: optional_i64(row, "failed_attempts").unwrap_or_default(),
+        failed_window_started_at: row
+            .get::<Option<String>>("failed_window_started_at")
+            .flatten(),
+        locked_until: row.get::<Option<String>>("locked_until").flatten(),
     }
 }
 
@@ -465,6 +479,9 @@ fn select_credentials() -> sea_query::SelectStatement {
             "created_at",
             "last_used_at",
             "passkey_suspect_at",
+            "failed_attempts",
+            "failed_window_started_at",
+            "locked_until",
         ])
         .from(iden("credentials"));
     select
@@ -1502,4 +1519,87 @@ pub async fn purge_user(db: &dyn Database, user_id: &str) -> Result<u64, DbError
     }
     removed += delete_user(db, user_id).await?;
     Ok(removed)
+}
+
+/// The password credential for a user, if they have one.
+///
+/// # Errors
+///
+/// [`DbError::Query`] when the statement fails.
+pub async fn password_credential(
+    db: &dyn Database,
+    user_id: &str,
+) -> Result<Option<CredentialRow>, DbError> {
+    let query = select_credentials()
+        .and_where(Expr::col(iden("user_id")).eq(user_id))
+        .and_where(Expr::col(iden("kind")).eq(CREDENTIAL_PASSWORD))
+        .limit(1)
+        .to_owned();
+    let rows = db.query(&Statement::render(&query)).await?;
+    Ok(rows.first().map(credential_from))
+}
+
+/// Replaces a password credential's hash and clears its lockout.
+///
+/// Used by a password change and by a rehash on login, which is why it
+/// resets the counter: both mean the person proved they hold the password.
+///
+/// # Errors
+///
+/// [`DbError::Execute`] when the statement fails.
+pub async fn set_password_hash(
+    db: &dyn Database,
+    id: &str,
+    password_hash: &str,
+) -> Result<u64, DbError> {
+    let mut update = Query::update();
+    update
+        .table(iden("credentials"))
+        .values([
+            (iden("password_hash"), password_hash.into()),
+            (iden("failed_attempts"), 0.into()),
+            (
+                iden("failed_window_started_at"),
+                sea_query::Value::String(None).into(),
+            ),
+            (iden("locked_until"), sea_query::Value::String(None).into()),
+        ])
+        .and_where(Expr::col(iden("id")).eq(id));
+    db.execute(&Statement::render(&update)).await
+}
+
+/// Records the lockout state after an attempt.
+///
+/// One statement rather than a read-modify-write from the caller, so two
+/// concurrent failures cannot both read `4` and both write `5`. It is
+/// still not atomic — the `Database` port has no compare-and-set — so the
+/// worst case is one lost increment under exactly simultaneous requests,
+/// which costs an attacker nothing and a person nothing.
+///
+/// # Errors
+///
+/// [`DbError::Execute`] when the statement fails.
+pub async fn set_password_lockout(
+    db: &dyn Database,
+    id: &str,
+    failed_attempts: i64,
+    window_started_at: Option<&str>,
+    locked_until: Option<&str>,
+) -> Result<u64, DbError> {
+    let mut update = Query::update();
+    update
+        .table(iden("credentials"))
+        .values([
+            (iden("failed_attempts"), failed_attempts.into()),
+            (
+                iden("failed_window_started_at"),
+                window_started_at.map_or(sea_query::Value::String(None).into(), Into::into),
+            ),
+            (
+                iden("locked_until"),
+                locked_until.map_or(sea_query::Value::String(None).into(), Into::into),
+            ),
+        ])
+        .and_where(Expr::col(iden("id")).eq(id));
+    db.execute(&Statement::render(&update)).await
 }

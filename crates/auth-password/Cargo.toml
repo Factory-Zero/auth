@@ -1,0 +1,37 @@
+[package]
+name = "factory0-auth-password"
+description = "Email and password login for the Factory Zero auth service: argon2id, an account lockout the rate limiter cannot provide, and answers that reveal nothing about who has an account (issues #12, #19, #20)"
+readme = "README.md"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+factory0-core = { workspace = true }
+# auth-core owns the schema, the linking rules, the argon2 parameters and
+# the step that turns a verified identity into a session.
+factory0-auth-core = { path = "../auth-core" }
+axum = { workspace = true }
+http = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true }
+tracing = { workspace = true }
+sha1 = "0.10"
+base16ct = { version = "0.2", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+factory0-testing = { workspace = true }
+factory0-adapter-sqlite = { workspace = true }
+pollster = { workspace = true }
+tower = { workspace = true }
+async-trait = { workspace = true }
+argon2 = { workspace = true }
+base64ct = { workspace = true }

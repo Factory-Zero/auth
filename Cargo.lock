@@ -853,6 +853,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "factory0-auth-password"
+version = "0.1.0"
+dependencies = [
+ "argon2",
+ "async-trait",
+ "axum",
+ "base16ct 0.2.0",
+ "base64ct",
+ "bytes",
+ "factory0-adapter-sqlite",
+ "factory0-auth-core",
+ "factory0-core",
+ "factory0-testing",
+ "http",
+ "pollster",
+ "serde",
+ "serde_json",
+ "sha1",
+ "time",
+ "tower",
+ "tracing",
+]
+
+[[package]]
 name = "factory0-core"
 version = "0.3.0"
 source = "git+https://github.com/Cratefield/harness?rev=45c34a4cc1ad8e2ed0c0077093590a424623f0bd#45c34a4cc1ad8e2ed0c0077093590a424623f0bd"
@@ -2292,6 +2316,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "sha1"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "digest 0.10.7",
 ]
 
 [[package]]

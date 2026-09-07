@@ -75,6 +75,9 @@ fn passkey(id: &str, user_id: &str, credential_id: &[u8]) -> CredentialRow {
         created_at: iso(NOW_SECS),
         last_used_at: None,
         passkey_suspect_at: None,
+        failed_attempts: 0,
+        failed_window_started_at: None,
+        locked_until: None,
     }
 }
 
@@ -93,6 +96,9 @@ fn password_credential(id: &str, user_id: &str, phc: &str) -> CredentialRow {
         created_at: iso(NOW_SECS),
         last_used_at: None,
         passkey_suspect_at: None,
+        failed_attempts: 0,
+        failed_window_started_at: None,
+        locked_until: None,
     }
 }
 

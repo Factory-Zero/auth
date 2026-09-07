@@ -41,8 +41,9 @@ pub mod redirect_uri;
 pub mod tokens;
 
 pub use secrets::{
-    CLIENT_DISABLED, SECRET_BYTES, SecretError, ensure_client_usable, generate_secret, hash_secret,
-    kind_allows_secret, verify_client_secret, verify_secret,
+    CLIENT_DISABLED, SECRET_BYTES, SecretError, ensure_client_usable, generate_secret,
+    hash_password, hash_secret, kind_allows_secret, password_needs_rehash, verify_client_secret,
+    verify_password, verify_secret,
 };
 pub use sessions::{
     ABSOLUTE_CAP_DAYS, COOKIE_NAME, IssuedSession, Login, SESSION_INVALID, SESSION_VALUE_BYTES,
@@ -60,13 +61,13 @@ pub use store::{
     delete_credential, delete_identity, delete_user, deletion_job_by_code, identities_by_user,
     identity_by_provider_subject, insert_client, insert_credential, insert_deletion_job,
     insert_identity, insert_redirect_uri, insert_session, insert_single_use_token, insert_user,
-    list_clients, mark_passkey_suspect, passkey_by_credential_id, pending_deletion_jobs,
-    purge_expired_sessions, purge_expired_single_use_tokens, purge_user, redirect_uris_for_client,
-    replace_redirect_uris, revoke_all_sessions, revoke_session, rotate_client_secret,
-    session_by_id, session_by_token_hash, sessions_by_user, single_use_token_by_hash,
-    slide_session, touch_credential_used, touch_identity_login, touch_session_seen,
-    update_client_name, update_client_status, update_passkey_sign_count, user_by_id,
-    user_by_primary_email,
+    list_clients, mark_passkey_suspect, passkey_by_credential_id, password_credential,
+    pending_deletion_jobs, purge_expired_sessions, purge_expired_single_use_tokens, purge_user,
+    redirect_uris_for_client, replace_redirect_uris, revoke_all_sessions, revoke_session,
+    rotate_client_secret, session_by_id, session_by_token_hash, sessions_by_user,
+    set_password_hash, set_password_lockout, single_use_token_by_hash, slide_session,
+    touch_credential_used, touch_identity_login, touch_session_seen, update_client_name,
+    update_client_status, update_passkey_sign_count, user_by_id, user_by_primary_email,
 };
 pub use tokens::{
     ACCESS_TOKEN_SECS, JWKS_CACHE_CONTROL, OIDC_CACHE_CONTROL, REFRESH_TOKEN_DAYS, RefreshGrant,
@@ -106,6 +107,15 @@ const MIGRATION_DELETION_JOBS: SqlMigration = SqlMigration {
     id: "0005",
     name: "deletion_jobs",
     sql: include_str!("../migrations/sqlite/0005_deletion_jobs.sql"),
+};
+
+/// The password lockout of issue #12: the per-account failure counter
+/// the `RateLimiter` port cannot provide, because it is keyed on the
+/// account rather than on the request.
+const MIGRATION_PASSWORD_LOCKOUT: SqlMigration = SqlMigration {
+    id: "0006",
+    name: "password_lockout",
+    sql: include_str!("../migrations/sqlite/0006_password_lockout.sql"),
 };
 
 /// The passkey clone signal of issue #14: `credentials.passkey_suspect_at`.
@@ -209,12 +219,13 @@ impl Module for AuthCore {
     }
 
     fn migrations(&self) -> factory0_core::Migrations {
-        const MIGRATIONS: [SqlMigration; 5] = [
+        const MIGRATIONS: [SqlMigration; 6] = [
             MIGRATION_INIT,
             MIGRATION_ROTATION,
             MIGRATION_TOKENS,
             MIGRATION_SUSPECT,
             MIGRATION_DELETION_JOBS,
+            MIGRATION_PASSWORD_LOCKOUT,
         ];
         factory0_core::Migrations {
             sqlite: &MIGRATIONS,
@@ -332,7 +343,7 @@ mod tests {
     #[test]
     fn migrations_are_the_embedded_set_in_order() {
         let migrations = AuthCore::new().migrations();
-        assert_eq!(migrations.sqlite.len(), 5);
+        assert_eq!(migrations.sqlite.len(), 6);
         assert_eq!(migrations.sqlite[0].id, "0001");
         assert_eq!(migrations.sqlite[0].name, "init");
         assert_eq!(migrations.sqlite[1].id, "0002");
@@ -343,6 +354,8 @@ mod tests {
         assert_eq!(migrations.sqlite[3].name, "passkey_suspect");
         assert_eq!(migrations.sqlite[4].id, "0005");
         assert_eq!(migrations.sqlite[4].name, "deletion_jobs");
+        assert_eq!(migrations.sqlite[5].id, "0006");
+        assert_eq!(migrations.sqlite[5].name, "password_lockout");
         assert!(migrations.postgres.is_empty());
         assert_eq!(
             migrations.sqlite[0].sql,

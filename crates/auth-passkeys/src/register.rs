@@ -241,6 +241,9 @@ async fn verify(
             created_at: now.clone(),
             last_used_at: None,
             passkey_suspect_at: None,
+            failed_attempts: 0,
+            failed_window_started_at: None,
+            locked_until: None,
         },
     )
     .await
