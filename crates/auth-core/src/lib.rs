@@ -19,6 +19,12 @@
 //! 3. **A signing key's private half never reaches an output.**
 //!    `tokens::SigningKeys` prints key ids only, and the published JWKS
 //!    is built from the re-derived public point (issue #9).
+//! 4. **Changing how somebody signs in needs a recent login, not just a
+//!    live session** (issue #31). [`require_recent_authentication`] is the
+//!    one rule, and the window is one key —
+//!    `AUTH_CORE_STEP_UP_WINDOW_SECS`, default 900 — because a deployment
+//!    that hardened one login method and forgot another would have
+//!    hardened nothing.
 
 #![forbid(unsafe_code)]
 
@@ -46,9 +52,11 @@ pub use secrets::{
     verify_password, verify_secret,
 };
 pub use sessions::{
-    ABSOLUTE_CAP_DAYS, COOKIE_NAME, IssuedSession, Login, SESSION_INVALID, SESSION_VALUE_BYTES,
-    SLIDE_AFTER_SECS, SLIDE_WINDOW_DAYS, Session, SessionError, ValidSession, clear_cookie,
-    cookie_value, issue, revoke_all, set_cookie, ua_family, validate,
+    ABSOLUTE_CAP_DAYS, COOKIE_NAME, DEFAULT_STEP_UP_WINDOW_SECS, IssuedSession, Login,
+    MAX_STEP_UP_WINDOW_SECS, MIN_STEP_UP_WINDOW_SECS, REAUTHENTICATION_REQUIRED, SESSION_INVALID,
+    SESSION_VALUE_BYTES, SLIDE_AFTER_SECS, SLIDE_WINDOW_DAYS, Session, SessionError, ValidSession,
+    clear_cookie, cookie_value, issue, require_recent_authentication, revoke_all, set_cookie,
+    step_up_window_secs, ua_family, validate,
 };
 pub use store::{
     Bytes, CLIENT_CONFIDENTIAL, CLIENT_PUBLIC, CREDENTIAL_PASSKEY, CREDENTIAL_PASSWORD,

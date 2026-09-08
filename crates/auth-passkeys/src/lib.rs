@@ -228,6 +228,9 @@ impl RelyingParty {
 pub(crate) struct ModuleState {
     pub ctx: Arc<ModuleContext>,
     pub rp: Option<RelyingParty>,
+    /// How recent a login has to be to add or remove a passkey (issue #31).
+    /// Resolved by `auth-core` so every login method reads one key.
+    pub step_up_window_secs: i64,
 }
 
 impl ModuleState {
@@ -295,15 +298,22 @@ impl Module for Passkeys {
     }
 
     fn validate_config(&self, cfg: &dyn Config) -> Result<(), ConfigError> {
-        match RelyingParty::from_config(cfg) {
-            Ok(_) => Ok(()),
-            Err(problems) => {
-                let mut errors = ConfigError::default();
-                for problem in problems {
-                    errors.push(format!("auth-passkeys: {problem}"));
-                }
-                Err(errors)
+        let mut errors = ConfigError::default();
+        if let Err(problems) = RelyingParty::from_config(cfg) {
+            for problem in problems {
+                errors.push(format!("auth-passkeys: {problem}"));
             }
+        }
+        // The step-up window is auth-core's key, but a deployment that
+        // mistypes it should hear about it from whichever module enforces
+        // it rather than silently getting the default.
+        if let Err(problem) = factory0_auth_core::step_up_window_secs(cfg) {
+            errors.push(format!("auth-passkeys: {problem}"));
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
         }
     }
 
@@ -321,9 +331,18 @@ impl Module for Passkeys {
                 None
             }
         };
+        // A bad value is reported by `validate_config`; here it degrades to
+        // the default rather than taking the module down, and the default
+        // is the stricter of the two outcomes anyway.
+        let step_up_window_secs = factory0_auth_core::step_up_window_secs(&*ctx.config)
+            .unwrap_or_else(|problem| {
+                tracing::error!(problem, "the step-up window is unusable; using the default");
+                factory0_auth_core::DEFAULT_STEP_UP_WINDOW_SECS
+            });
         let state = Arc::new(ModuleState {
             ctx: Arc::new(ctx),
             rp,
+            step_up_window_secs,
         });
         register::router().merge(login::router()).with_state(state)
     }

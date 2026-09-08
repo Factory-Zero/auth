@@ -464,3 +464,243 @@ fn one_person_cannot_delete_another_persons_passkey() {
         assert_eq!(response.status, StatusCode::NOT_FOUND);
     });
 }
+
+// --- Step-up: changing how you sign in needs a recent login (issue #31) ---
+
+const REAUTH: &str = "https://factory0.ventures/problems/auth/reauthentication-required";
+
+/// Registers one passkey and returns (session cookie, credential row id),
+/// with the clock still at the moment of the login.
+async fn a_registered_passkey(kit: &support::Kit) -> (String, String) {
+    let user = kit.user("nick@example.com").await;
+    let cookie = kit.sign_in(&user).await;
+    let options = post(kit, OPTIONS, "{}", Some(&cookie)).await;
+    assert_eq!(options.status, StatusCode::OK, "{}", options.text());
+    let authenticator = SoftAuthenticator::new(Algorithm::Es256);
+    let credential = authenticator.register(RP_ID, ORIGIN, &challenge_of(&options.json()));
+    let verified = post(
+        kit,
+        VERIFY,
+        &verify_body(&credential, "laptop"),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(verified.status, StatusCode::OK, "{}", verified.text());
+    let listed = send(kit, Method::GET, CREDENTIALS, None, Some(&cookie))
+        .await
+        .json();
+    let id = listed["passkeys"][0]["id"]
+        .as_str()
+        .expect("a credential id")
+        .to_owned();
+    (cookie, id)
+}
+
+#[test]
+fn a_session_older_than_the_window_cannot_add_a_passkey() {
+    // The attack: a session cookie that was stolen, or left open on a
+    // shared machine, adds a passkey. That passkey then outlives the
+    // password change and the session revocation the person does when they
+    // notice, and nothing about it looks unusual on the account page.
+    pollster::block_on(async {
+        let kit = support::kit();
+        let user = kit.user("nick@example.com").await;
+        let cookie = kit.sign_in(&user).await;
+
+        kit.clock
+            .advance_secs(factory0_auth_core::DEFAULT_STEP_UP_WINDOW_SECS + 1);
+
+        let response = post(&kit, OPTIONS, "{}", Some(&cookie)).await;
+        assert_eq!(
+            response.status,
+            StatusCode::FORBIDDEN,
+            "a stale session was allowed to start a registration: {}",
+            response.text()
+        );
+        // 403 and its own type, not the 401 a signed-out caller gets: the
+        // client should re-authenticate and retry, not start a full login.
+        assert_eq!(response.json()["type"], REAUTH);
+    });
+}
+
+#[test]
+fn a_session_older_than_the_window_cannot_finish_a_registration() {
+    // The second half of the same door. Guarding only `options` would let a
+    // caller collect a challenge while fresh and spend it later.
+    pollster::block_on(async {
+        let kit = support::kit();
+        let user = kit.user("nick@example.com").await;
+        let cookie = kit.sign_in(&user).await;
+
+        let options = post(&kit, OPTIONS, "{}", Some(&cookie)).await;
+        assert_eq!(options.status, StatusCode::OK, "{}", options.text());
+        let authenticator = SoftAuthenticator::new(Algorithm::Es256);
+        let credential = authenticator.register(RP_ID, ORIGIN, &challenge_of(&options.json()));
+
+        kit.clock
+            .advance_secs(factory0_auth_core::DEFAULT_STEP_UP_WINDOW_SECS + 1);
+
+        let response = post(
+            &kit,
+            VERIFY,
+            &verify_body(&credential, "laptop"),
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(
+            response.status,
+            StatusCode::FORBIDDEN,
+            "a challenge taken while fresh was spent after the window: {}",
+            response.text()
+        );
+        assert_eq!(response.json()["type"], REAUTH);
+    });
+}
+
+#[test]
+fn a_session_older_than_the_window_cannot_remove_a_passkey() {
+    // Removal matters as much as addition: stripping somebody's only
+    // passkey is how you force them onto a weaker method you control.
+    pollster::block_on(async {
+        let kit = support::kit();
+        let (cookie, id) = a_registered_passkey(&kit).await;
+
+        kit.clock
+            .advance_secs(factory0_auth_core::DEFAULT_STEP_UP_WINDOW_SECS + 1);
+
+        let response = send(
+            &kit,
+            Method::DELETE,
+            &format!("{CREDENTIALS}/{id}"),
+            None,
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(
+            response.status,
+            StatusCode::FORBIDDEN,
+            "a stale session removed a passkey: {}",
+            response.text()
+        );
+        assert_eq!(response.json()["type"], REAUTH);
+    });
+}
+
+#[test]
+fn a_session_inside_the_window_still_works() {
+    // The other half, and the one that would make this feature useless if
+    // it were wrong: the rule must not refuse a person who signed in a
+    // moment ago.
+    pollster::block_on(async {
+        let kit = support::kit();
+        let user = kit.user("nick@example.com").await;
+        let cookie = kit.sign_in(&user).await;
+
+        // One second short of the window: still allowed.
+        kit.clock
+            .advance_secs(factory0_auth_core::DEFAULT_STEP_UP_WINDOW_SECS - 1);
+
+        let response = post(&kit, OPTIONS, "{}", Some(&cookie)).await;
+        assert_eq!(
+            response.status,
+            StatusCode::OK,
+            "a session inside the window was refused: {}",
+            response.text()
+        );
+    });
+}
+
+#[test]
+fn listing_passkeys_does_not_need_a_recent_login() {
+    // Deliberate asymmetry: reading which passkeys exist changes nothing,
+    // and making the account page demand a re-authentication to render
+    // would train people to re-authenticate for no reason.
+    pollster::block_on(async {
+        let kit = support::kit();
+        let (cookie, _) = a_registered_passkey(&kit).await;
+
+        kit.clock
+            .advance_secs(factory0_auth_core::DEFAULT_STEP_UP_WINDOW_SECS + 1);
+
+        let response = send(&kit, Method::GET, CREDENTIALS, None, Some(&cookie)).await;
+        assert_eq!(
+            response.status,
+            StatusCode::OK,
+            "listing was refused: {}",
+            response.text()
+        );
+        assert_eq!(
+            response.json()["passkeys"]
+                .as_array()
+                .expect("passkeys")
+                .len(),
+            1
+        );
+    });
+}
+
+#[test]
+fn the_window_is_configurable_and_validated() {
+    // A deployment can widen or narrow it, and a typo is a build failure
+    // rather than a silent default.
+    use cratefield_core::Module as _;
+
+    let mut pairs = support::config_pairs();
+    pairs.push((
+        "AUTH_CORE_STEP_UP_WINDOW_SECS".to_owned(),
+        "not-a-number".to_owned(),
+    ));
+    let config = cratefield_core::MapConfig::from_pairs(pairs);
+    let refused = factory0_auth_passkeys::Passkeys::new()
+        .validate_config(&config)
+        .expect_err("a non-numeric window was accepted");
+    assert!(
+        format!("{refused:?}").contains("AUTH_CORE_STEP_UP_WINDOW_SECS"),
+        "the error does not name the key: {refused:?}"
+    );
+
+    for bad in ["0", "59", "86401", "-900"] {
+        let mut pairs = support::config_pairs();
+        pairs.push(("AUTH_CORE_STEP_UP_WINDOW_SECS".to_owned(), bad.to_owned()));
+        assert!(
+            factory0_auth_passkeys::Passkeys::new()
+                .validate_config(&cratefield_core::MapConfig::from_pairs(pairs))
+                .is_err(),
+            "{bad} was accepted as a step-up window"
+        );
+    }
+
+    // And a sane value is taken.
+    let mut pairs = support::config_pairs();
+    pairs.push(("AUTH_CORE_STEP_UP_WINDOW_SECS".to_owned(), "300".to_owned()));
+    assert!(
+        factory0_auth_passkeys::Passkeys::new()
+            .validate_config(&cratefield_core::MapConfig::from_pairs(pairs))
+            .is_ok()
+    );
+}
+
+#[test]
+fn a_narrower_window_is_enforced_not_merely_accepted() {
+    // Configuration that parses but does nothing is the usual way a
+    // security setting fails, so assert the number reaches the guard.
+    pollster::block_on(async {
+        let mut pairs = support::config_pairs();
+        pairs.push(("AUTH_CORE_STEP_UP_WINDOW_SECS".to_owned(), "60".to_owned()));
+        let kit = support::kit_with(pairs);
+        let user = kit.user("nick@example.com").await;
+        let cookie = kit.sign_in(&user).await;
+
+        // Well inside the default window, well outside the configured one.
+        kit.clock.advance_secs(61);
+
+        let response = post(&kit, OPTIONS, "{}", Some(&cookie)).await;
+        assert_eq!(
+            response.status,
+            StatusCode::FORBIDDEN,
+            "the configured 60s window was not applied: {}",
+            response.text()
+        );
+        assert_eq!(response.json()["type"], REAUTH);
+    });
+}

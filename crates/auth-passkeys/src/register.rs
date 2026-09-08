@@ -24,7 +24,9 @@ use webauthn_rs_proto::{
 };
 
 use crate::challenge::{self, PURPOSE_REGISTER};
-use crate::request::{b64u, ceremony_failed, hex, internal, ok, ports, require_session};
+use crate::request::{
+    b64u, ceremony_failed, hex, internal, ok, ports, require_recent_session, require_session,
+};
 use crate::webauthn::{UserVerification, verify_registration};
 use crate::{COSE_EDDSA, COSE_ES256, COSE_RS256, ModuleState};
 
@@ -52,7 +54,7 @@ async fn options(
     scope: Scope,
     headers: HeaderMap,
 ) -> Result<Response, Problem> {
-    let session = require_session(&state, &headers, &scope).await?;
+    let session = require_recent_session(&state, &headers, &scope).await?;
     let rp = state.rp()?;
     let (db, clock, id_gen) = ports(&state)?;
 
@@ -162,7 +164,7 @@ async fn verify(
     headers: HeaderMap,
     Json(body): Json<VerifyBody>,
 ) -> Result<Response, Problem> {
-    let session = require_session(&state, &headers, &scope).await?;
+    let session = require_recent_session(&state, &headers, &scope).await?;
     let rp = state.rp()?;
     let (db, clock, id_gen) = ports(&state)?;
 
@@ -344,7 +346,7 @@ async fn remove(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Response, Problem> {
-    let session = require_session(&state, &headers, &scope).await?;
+    let session = require_recent_session(&state, &headers, &scope).await?;
     let (db, _, _) = ports(&state)?;
 
     let credentials = credentials_by_user(db, &session.user_id)
