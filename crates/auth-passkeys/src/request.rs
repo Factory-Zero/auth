@@ -50,6 +50,33 @@ pub(crate) async fn require_session(
     }
 }
 
+/// The signed-in user, for an endpoint that **changes how they sign in**.
+///
+/// A live session is not enough here (issue #31). Adding a passkey to a
+/// hijacked session is the classic persistence step: the passkey outlives
+/// the password change and the session revocation that follow, and nothing
+/// about it looks unusual on an account page. So the login behind the
+/// session has to be recent, not merely valid.
+///
+/// The refusal is `403 auth/reauthentication-required`, distinct from the
+/// `401` a signed-out caller gets, so a client re-authenticates and retries
+/// instead of dropping the person into a full login.
+pub(crate) async fn require_recent_session(
+    state: &ModuleState,
+    headers: &HeaderMap,
+    scope: &Scope,
+) -> Result<ValidSession, Problem> {
+    let session = require_session(state, headers, scope).await?;
+    let (_, clock, _) = ports(state)?;
+    factory0_auth_core::require_recent_authentication(
+        &session,
+        clock.now(),
+        state.step_up_window_secs,
+    )
+    .map_err(|problem| problem.instance(&scope.request_id))?;
+    Ok(session)
+}
+
 /// The rate limit on the two endpoints anyone can call. Keyed on the client
 /// address **only**: keying on the email as well would let anyone lock a
 /// named account out of its own logins, which trades one denial of service

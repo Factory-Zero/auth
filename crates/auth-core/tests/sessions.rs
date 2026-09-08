@@ -198,12 +198,20 @@ async fn issue_stores_only_the_hash_and_builds_the_host_cookie() {
     let ok = validate(&*kit.db, &at(EPOCH + 60), &issued.value)
         .await
         .expect("validate");
+    let ok = ok.expect("the session validates");
+    assert_eq!(ok.id, issued.session_id);
+    assert_eq!(ok.user_id, "u1");
+    // The login behind the session, not the moment it was last used: this
+    // is what the step-up rule reads, and sliding must never move it.
     assert_eq!(
-        ok,
-        Some(factory0_auth_core::ValidSession {
-            id: issued.session_id.clone(),
-            user_id: "u1".to_owned()
-        })
+        ok.authenticated_at.unix_timestamp(),
+        EPOCH,
+        "authenticated_at is not the login time"
+    );
+    assert_eq!(
+        ok.amr,
+        vec!["passkey".to_owned()],
+        "the amr recorded at login was lost"
     );
     assert!(
         validate(

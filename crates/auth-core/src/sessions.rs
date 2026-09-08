@@ -53,6 +53,32 @@ pub const SESSION_INVALID: cratefield_core::ProblemDef = cratefield_core::Proble
     description: "Missing, unknown, revoked or expired session — not distinguished",
 };
 
+/// Changing how somebody signs in needs an authentication newer than this,
+/// not merely a live session (issue #31). Fifteen minutes is the common
+/// default: long enough to add a passkey without signing in twice, short
+/// enough that a session left open on a shared machine cannot be turned
+/// into permanent access.
+pub const DEFAULT_STEP_UP_WINDOW_SECS: i64 = 900;
+/// Below a minute the window is unusable: a person cannot finish a WebAuthn
+/// ceremony inside it.
+pub const MIN_STEP_UP_WINDOW_SECS: i64 = 60;
+/// Above a day it is not a step-up, it is a session lifetime.
+pub const MAX_STEP_UP_WINDOW_SECS: i64 = 86_400;
+
+/// The session is real, but the login behind it is too old to change how
+/// this account signs in.
+///
+/// `403`, not `401`, and that distinction is the point: a client that got a
+/// `401` should send the person through a full login, while this one should
+/// re-authenticate them and retry. Answering both with
+/// [`SESSION_INVALID`] would make a step-up look like a logout.
+pub const REAUTHENTICATION_REQUIRED: cratefield_core::ProblemDef = cratefield_core::ProblemDef {
+    slug: "auth/reauthentication-required",
+    status: StatusCode::FORBIDDEN,
+    title: "Sign in again to change how you sign in",
+    description: "The session is valid, but the authentication behind it is older than the step-up window",
+};
+
 /// Failure while issuing a session: entropy or database. The cookie
 /// value never leaves the failing call.
 #[derive(Debug, thiserror::Error)]
@@ -75,6 +101,74 @@ pub enum SessionError {
 pub struct ValidSession {
     pub id: String,
     pub user_id: String,
+    /// When the login behind this session happened — the session's own
+    /// `created_at`, which sliding never moves.
+    pub authenticated_at: OffsetDateTime,
+    /// RFC 8176 method references recorded at that login, empty when the
+    /// login method wired none. Read rather than ignored so a later rule
+    /// can ask *how* somebody authenticated, not only how long ago.
+    pub amr: Vec<String>,
+}
+
+impl ValidSession {
+    /// Whether the login behind this session is newer than `window_secs`.
+    ///
+    /// A session whose `created_at` is in the future counts as recent: that
+    /// is clock skew between the writer and the reader, and the safe
+    /// failure for skew is not to lock somebody out of their own account
+    /// page. The window itself is validated on the way in, so it cannot be
+    /// negative here.
+    #[must_use]
+    pub fn authenticated_within(&self, now: OffsetDateTime, window_secs: i64) -> bool {
+        now - self.authenticated_at <= time::Duration::seconds(window_secs)
+    }
+}
+
+/// The step-up guard: a live session is not enough to change how somebody
+/// signs in (issue #31).
+///
+/// # Errors
+///
+/// [`REAUTHENTICATION_REQUIRED`] when the login behind the session is older
+/// than `window_secs`. The caller adds its own `instance`.
+pub fn require_recent_authentication(
+    session: &ValidSession,
+    now: OffsetDateTime,
+    window_secs: i64,
+) -> Result<(), Problem> {
+    if session.authenticated_within(now, window_secs) {
+        Ok(())
+    } else {
+        Err(Problem::new(&REAUTHENTICATION_REQUIRED))
+    }
+}
+
+/// Resolves the step-up window from configuration.
+///
+/// Owned by `auth-core` and keyed `AUTH_CORE_STEP_UP_WINDOW_SECS` rather
+/// than per module, because every login method has to apply the same rule:
+/// a deployment that hardened passkeys and forgot passwords would have
+/// hardened nothing.
+///
+/// # Errors
+///
+/// A message naming the key when the value is not a whole number of seconds
+/// inside [`MIN_STEP_UP_WINDOW_SECS`]..=[`MAX_STEP_UP_WINDOW_SECS`].
+pub fn step_up_window_secs(cfg: &dyn cratefield_core::Config) -> Result<i64, String> {
+    let module = cratefield_core::ModuleConfig::new("auth-core", cfg);
+    match module.get_opt("STEP_UP_WINDOW_SECS") {
+        None => Ok(DEFAULT_STEP_UP_WINDOW_SECS),
+        Some(raw) => match raw.trim().parse::<i64>() {
+            Ok(secs) if (MIN_STEP_UP_WINDOW_SECS..=MAX_STEP_UP_WINDOW_SECS).contains(&secs) => {
+                Ok(secs)
+            }
+            _ => Err(format!(
+                "{} must be between {MIN_STEP_UP_WINDOW_SECS} and \
+                 {MAX_STEP_UP_WINDOW_SECS} seconds, got {raw:?}",
+                module.key("STEP_UP_WINDOW_SECS")
+            )),
+        },
+    }
 }
 
 pub(crate) fn iso(t: OffsetDateTime) -> String {
@@ -357,9 +451,23 @@ pub async fn validate(
         }
     }
 
+    let authenticated_at = OffsetDateTime::parse(&row.created_at, &Rfc3339)
+        .map_err(|_| DbError::Query("session created_at is malformed".to_owned()))?;
+    // A malformed `amr` is not worth refusing a session over: it is
+    // provenance, not authority. Log it and carry on with none.
+    let amr = match row.amr.as_deref() {
+        None => Vec::new(),
+        Some(raw) => serde_json::from_str::<Vec<String>>(raw).unwrap_or_else(|_| {
+            tracing::warn!(session = %row.id, "session amr is not a JSON array of strings");
+            Vec::new()
+        }),
+    };
+
     Ok(Some(ValidSession {
         id: row.id,
         user_id: row.user_id,
+        authenticated_at,
+        amr,
     }))
 }
 
