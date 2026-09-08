@@ -24,6 +24,8 @@ askama = "0.14.0"
 cratefield-core = "0.3"
 cratefield-testing = "0.1"
 cratefield-adapter-sqlite = "0.1"
+cratefield-runtime-cloudflare = "0.1"
+cratefield-adapter-resend = "0.1"
 
 # Versions mirror the harness workspace so the git harness crates and our
 # direct dependencies unify into one dependency tree.
@@ -134,6 +136,9 @@ sha2 = { version = "0.11.0", default-features = false }
 # Enabled by wasm leaf crates (same as the harness venture example):
 # getrandom (via ulid/rand through cratefield-core) needs the opt-in
 # wasm_js backend on wasm32-unknown-unknown.
+# workers-rs runtime for the deployable auth Worker (auth#41). `http` stays
+# OFF (harness note: it hangs D1); `d1` on for the database binding.
+worker = { version = "0.8.5", default-features = false, features = ["d1"] }
 getrandom = { version = "0.4.3", default-features = false, features = [
     "wasm_js",
 ] }

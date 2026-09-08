@@ -1,0 +1,34 @@
+# The deployable auth Worker (auth#41). One Worker + one D1 per environment,
+# the shape of any harness venture (venture-backend-template).
+#
+# needs-human before first deploy: `wrangler d1 create` for each environment
+# and paste the ids below; set HARNESS_SECRET (+ HARNESS_SECRET_PREVIOUS on
+# rotation) and RESEND_API_KEY as secrets per environment; add the
+# auth.factory0.ventures custom domain on the Kontinuum Cloudflare account.
+name = "factory0-auth"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-09-01"
+workers_dev = false
+
+[build]
+command = "cargo install -q worker-build && worker-build --release"
+
+[observability]
+enabled = true
+
+# --- Staging (deployed from `main`) ---
+[[d1_databases]]
+binding = "DB"
+database_name = "factory0-auth-staging"
+database_id = "REPLACE_WITH_STAGING_D1_ID"
+migrations_dir = "migrations"
+
+# --- Production (deployed from a v* tag, behind the approval gate) ---
+[env.production]
+route = { pattern = "auth.factory0.ventures", custom_domain = true }
+
+[[env.production.d1_databases]]
+binding = "DB"
+database_name = "factory0-auth-production"
+database_id = "REPLACE_WITH_PRODUCTION_D1_ID"
+migrations_dir = "migrations"

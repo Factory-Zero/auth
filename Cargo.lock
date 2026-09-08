@@ -372,6 +372,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "cratefield-adapter-resend"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad30b8db2c39222ed3e9d8491945a313e71891cfede4639b04e2891682f564b6"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "cratefield-core",
+ "http",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "cratefield-adapter-sqlite"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -411,6 +426,30 @@ dependencies = [
  "tracing",
  "ulid",
  "unicode-normalization",
+]
+
+[[package]]
+name = "cratefield-runtime-cloudflare"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac6923ffa1fbd904d3fa34245eeac3e8589bed58705618e7f4532ed6f8be5d4d"
+dependencies = [
+ "async-trait",
+ "axum",
+ "bytes",
+ "cratefield-core",
+ "futures-core",
+ "futures-util",
+ "getrandom 0.4.3",
+ "http",
+ "sea-query",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "time",
+ "tower",
+ "tracing",
+ "worker",
 ]
 
 [[package]]
@@ -951,6 +990,24 @@ dependencies = [
  "time",
  "tower",
  "tracing",
+]
+
+[[package]]
+name = "factory0-auth-worker"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cratefield-adapter-resend",
+ "cratefield-core",
+ "cratefield-runtime-cloudflare",
+ "factory0-auth-core",
+ "factory0-auth-magic-link",
+ "factory0-auth-meta",
+ "factory0-auth-oidc",
+ "factory0-auth-passkeys",
+ "factory0-auth-password",
+ "getrandom 0.4.3",
+ "worker",
 ]
 
 [[package]]
