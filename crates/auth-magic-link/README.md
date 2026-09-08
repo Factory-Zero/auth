@@ -87,7 +87,7 @@ replacing the statement with a read-then-write fails that test.
 ## The mail
 
 Rendered through the harness template registry under
-`auth-magic-link.sign-in`, so a venture can override the wording, with the
+`auth-magic-link/sign-in`, so a venture can override the wording, with the
 compiled default as the fallback. The **text part carries the raw link**,
 because a client that shows only text must still be usable, and the HTML
 part carries it twice — once as a button, once as copyable text — for

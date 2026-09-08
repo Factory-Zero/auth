@@ -1,0 +1,26 @@
+{
+  "auth-core/0001": {
+    "file": "0001_auth-core_0001_init.sql",
+    "sha256": "dce00812b7a3aa55a289e7f274cbb2fc7d5ffba69574d88c0b493da0999d5549"
+  },
+  "auth-core/0002": {
+    "file": "0002_auth-core_0002_client_secret_rotation.sql",
+    "sha256": "20da789863765b4377573bf5d1b9ee863ff0bed02d608f0ae37b77b4135d9765"
+  },
+  "auth-core/0003": {
+    "file": "0003_auth-core_0003_token_issuing.sql",
+    "sha256": "b3e124f26e8636c5fdbec764a0df8e90b3c206728ec8d7914cab31a19cb89650"
+  },
+  "auth-core/0004": {
+    "file": "0004_auth-core_0004_passkey_suspect.sql",
+    "sha256": "319c648e151ffad380c92e4cb821140a579edd1bc63df288cccc9bbd34b962d5"
+  },
+  "auth-core/0005": {
+    "file": "0005_auth-core_0005_deletion_jobs.sql",
+    "sha256": "97436bee6686b30b70b5c6358b97835835b5cbb89c4678e42a294fd904504530"
+  },
+  "auth-core/0006": {
+    "file": "0006_auth-core_0006_password_lockout.sql",
+    "sha256": "1f5f91abc38c8f6809c2603d6453d30d3f8bc6587ed7db8e891f9ca3e611fd5e"
+  }
+}

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "spikes/*"]
+exclude = ["crates/auth-fz"]
 
 [workspace.package]
 version = "0.1.0"

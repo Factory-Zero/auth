@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// The registry id a venture overrides.
-pub const TEMPLATE_MAGIC_LINK: &str = "auth-magic-link.sign-in";
+pub const TEMPLATE_MAGIC_LINK: &str = "auth-magic-link/sign-in";
 
 /// What the template is given. Serialized through the registry, so it is
 /// a wire format: adding a field is fine, renaming one breaks overrides.

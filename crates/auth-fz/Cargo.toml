@@ -1,0 +1,25 @@
+# The venture-side `fz` (auth#41): a native binary that links the auth
+# venture's own harness so `fz migrations collect` can read this venture's
+# modules. Kept OUT of the workspace (see `exclude` in the root manifest) so
+# the CLI's native-only deps (clap, rusqlite) never reach the wasm build.
+[package]
+name = "factory0-auth-fz"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "fz"
+path = "src/main.rs"
+
+[dependencies]
+cratefield-core = "0.3"
+cratefield-cli = "0.1"
+factory0-auth-core = { path = "../auth-core" }
+factory0-auth-oidc = { path = "../auth-oidc" }
+factory0-auth-passkeys = { path = "../auth-passkeys" }
+factory0-auth-magic-link = { path = "../auth-magic-link" }
+factory0-auth-password = { path = "../auth-password" }
+factory0-auth-meta = { path = "../auth-meta" }
