@@ -61,6 +61,34 @@ first two expensive to reach. Not required — a module that refused to
 start without a captcha would take the whole service down — but `fz
 doctor` refuses a production venture with public writes and no captcha.
 
+## Rate limits
+
+This repo owns the key strings and the 429 behaviour, not the numbers.
+Quotas are enforced by the harness `RateLimiter` adapter and set in
+deployment config; keys are `auth-password:{key}` over
+`rate_limit_keys(ip, email)`, i.e. one per-IP bucket and one per
+normalised-email bucket. In-memory adapters are per-isolate, so a
+multi-isolate deployment needs a KV-backed limiter. Every refusal is
+`429` with a `Retry-After`.
+
+| Scope | Recommended quota | Why |
+|---|---|---|
+| Login per IP | 10/min | A person mistypes a few times; a guesser needs thousands. 10/min fits the former and is noise against Argon2id, while staying loose enough for an office or campus behind one NAT address. |
+| Login per normalised email, any IP | 5/15min | The per-IP bucket does nothing against a botnet guessing one account from many addresses. The email bucket is what catches that: 5 per 15 minutes still tolerates real mistyping but caps distributed guessing at under 500 tries a day per account, before the lockout below even matters. |
+| Lockout | 10 failures in an hour, frozen 15 minutes | Owned here (`AUTH_PASSWORD_LOCKOUT_*`, env-overridable, min-clamped). Ten is far above mistyping and far below a useful guessing rate; fifteen minutes makes guessing pointless without stranding somebody whose only login method is a password for the day. |
+| Registration and password change per IP | Same bucket policy as login | The proposal sets no number for these, so use the login one: both are anonymous (registration) or low-frequency (change) writes with the same abuse shape, and one knob is easier to operate than three. |
+
+The lockout freezes the **password**, not the person: passkey, OIDC and
+magic-link sign-ins still work during it (see
+`../auth-magic-link/README.md` for the way back in). Nothing clears the
+lockout row except wall-clock expiry and a successful password
+login/change — an alternative-method sign-in bypasses the freeze, it
+does not lift it.
+
+Captcha, where the port is present, is required on login (and on
+magic-link request): verification failure refuses the request rather
+than letting it through, so a captcha outage fails closed.
+
 ## Nothing here says whether an address has an account
 
 - **Registration** answers `202` and the same body whether it created an
