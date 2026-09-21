@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/STATUS-SPIKES-FF5A36?style=flat-square&labelColor=0A0A0B" alt="Status: spikes">
+  <img src="https://img.shields.io/badge/STATUS-BETA-FF5A36?style=flat-square&labelColor=0A0A0B" alt="Status: beta">
   <img src="https://img.shields.io/badge/LANGUAGE-RUST-EDEBE6?style=flat-square&labelColor=0A0A0B" alt="Language: Rust">
   <img src="https://img.shields.io/badge/RUNS%20ON-THE%20HARNESS-EDEBE6?style=flat-square&labelColor=0A0A0B" alt="Runs on the harness">
   <img src="https://img.shields.io/badge/LOGIN-PASSKEYS%20%C2%B7%20GOOGLE%20%C2%B7%20APPLE%20%C2%B7%20META%20%C2%B7%20PASSWORD%20%C2%B7%20MAGIC%20LINK-EDEBE6?style=flat-square&labelColor=0A0A0B" alt="Six login methods">
@@ -84,9 +84,9 @@ passkey is enabled. See [ADR 0103](docs/adr/0103-the-login-chooser-and-browser-s
 
 ## Status
 
-Design adopted 2026-09-06. Three spikes come first; everything else is
-blocked on them. Enterprise SAML SSO is deliberately deferred. Progress is in
-the [issues](../../issues) and [milestones](../../milestones).
+Design adopted 2026-09-06. Worker composes all merged modules and deploys
+via wrangler staging/prod. First deploy is blocked on owner steps: D1 IDs,
+secrets, domain, first v* tag. Enterprise SAML SSO is deliberately deferred.
 
 ## License
 
