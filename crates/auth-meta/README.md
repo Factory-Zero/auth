@@ -14,6 +14,8 @@ See [ADR 0104](../../docs/adr/0104-facebook-login-without-openid-connect.md).
 |---|---|
 | `GET /start?return_to=/path` | Builds the authorization URL with PKCE, seals the flow into a signed cookie, redirects |
 | `GET /callback?code&state` | Verifies the flow, exchanges the code, fetches the profile, applies the linking rules, issues a session |
+| `POST /data-deletion` | Verifies `signed_request`, records a deletion job, answers `{url, confirmation_code}` (issue #18) |
+| `GET /deletion-status?code=…` | Status page the callback answer points at: pending or done, nothing else |
 
 ## Configuration
 
@@ -84,8 +86,9 @@ discovered later.
 
 ## Known gaps
 
-- **The data deletion callback is not built** (#18). Meta will not approve the
-  app for public use without one. ADR 0104 decides what it deletes.
+- **The data deletion callback is built** (#18). `POST /data-deletion`
+  verifies `signed_request`, records a job drained by the scheduled handler,
+  and answers with the status URL. See [the app-review runbook](../../docs/meta-app-review.md).
 - **No manual run against a real Meta app.** Everything here is exercised
   against a fake that serves the token endpoint and the Graph profile shape,
   which covers this module's logic but not Meta's own behaviour: whether the
