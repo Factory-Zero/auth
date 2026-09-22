@@ -2,7 +2,8 @@
 
 use async_trait::async_trait;
 use cratefield_core::{
-    Clock, Config, Database, MailError, Mailer, MapConfig, Message, SendOutcome, Statement,
+    Clock, Config, Database, Decision, MailError, Mailer, MapConfig, Message, SendOutcome,
+    Statement,
 };
 use cratefield_testing::TestHarness;
 use factory0_auth_core::{AuthCore, STATUS_ACTIVE, UserRow, insert_user, user_by_primary_email};
@@ -71,6 +72,7 @@ impl Outbox {
 struct Kit {
     harness: TestHarness,
     outbox: Outbox,
+    limiter: cratefield_testing::FakeRateLimiter,
     clock: Arc<TestClock>,
     db: Arc<dyn Database>,
 }
@@ -80,6 +82,25 @@ fn kit() -> Kit {
 }
 
 fn kit_with(extra: &[(&str, &str)]) -> Kit {
+    kit_limited(extra, cratefield_testing::FakeRateLimiter::always_allow())
+}
+
+/// A kit whose limiter refuses everything, for the request endpoint anyone
+/// can call.
+fn kit_rate_limited() -> Kit {
+    kit_limited(
+        &[],
+        cratefield_testing::FakeRateLimiter::scripted(
+            Vec::new(),
+            Decision {
+                ok: false,
+                retry_after: Some(std::time::Duration::from_secs(30)),
+            },
+        ),
+    )
+}
+
+fn kit_limited(extra: &[(&str, &str)], limiter: cratefield_testing::FakeRateLimiter) -> Kit {
     let mut pairs = vec![
         ("AUTH_MAGIC_LINK_PUBLIC_BASE".to_owned(), BASE.to_owned()),
         (
@@ -95,12 +116,14 @@ fn kit_with(extra: &[(&str, &str)]) -> Kit {
     let config: Arc<dyn Config> = Arc::new(MapConfig::from_pairs(pairs));
 
     let mailer = outbox.clone();
+    let limiter_for_ports = limiter.clone();
     let clock_for_ports = clock.clone();
     let config_for_ports = config.clone();
     let harness = TestHarness::with_ports(
         vec![Box::new(AuthCore::new()), Box::new(MagicLink::new())],
         move |ports| {
             ports.mailer = Some(Arc::new(mailer));
+            ports.rate_limiter = Some(Arc::new(limiter_for_ports));
             ports.clock = Some(clock_for_ports);
             ports.config = config_for_ports;
         },
@@ -109,6 +132,7 @@ fn kit_with(extra: &[(&str, &str)]) -> Kit {
     Kit {
         harness,
         outbox,
+        limiter,
         clock,
         db,
     }
@@ -583,5 +607,46 @@ fn a_token_of_another_kind_cannot_be_spent_here() {
         assert_eq!(response.status, StatusCode::BAD_REQUEST);
         assert!(response.cookie("__Host-fz_session").is_none());
         assert_eq!(count(&kit, "sessions"), 0);
+    });
+}
+
+/// The request endpoint anyone can call is rate limited: a refused caller
+/// is told to wait, and nothing is written on the way to the refusal — no
+/// mail, no token row for a mail cannon to harvest.
+#[test]
+fn a_rate_limited_caller_is_told_to_wait_and_nothing_is_written() {
+    pollster::block_on(async {
+        let kit = kit_rate_limited();
+        seed(&kit, "ada@example.com", false).await;
+
+        let response = request_link(&kit, "ada@example.com").await;
+        assert_eq!(
+            response.status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "{}",
+            response.text()
+        );
+        assert!(response.headers.contains_key(header::RETRY_AFTER));
+
+        assert_eq!(kit.outbox.count(), 0, "a refused caller was mailed");
+        assert_eq!(count(&kit, "single_use_tokens"), 0);
+    });
+}
+
+#[test]
+fn the_limit_is_keyed_on_the_address_as_well_as_the_caller() {
+    pollster::block_on(async {
+        let kit = kit();
+
+        // The limit is consulted once per key, and there is more than one
+        // key: the caller and the address, so a botnet cannot walk past the
+        // per-caller limit by spreading one address across many machines —
+        // and cannot turn the endpoint into a mail cannon for one victim.
+        request_link(&kit, "ada@example.com").await;
+        assert!(
+            kit.limiter.calls() >= 2,
+            "the address was not a limit key: one request consulted the limiter {}",
+            kit.limiter.calls()
+        );
     });
 }

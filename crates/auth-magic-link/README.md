@@ -38,6 +38,29 @@ It is also the answer to three things other modules leave undone:
 A link that lasts a day is a password with a long tail; one that lasts a
 minute does not survive a slow mail queue. Hence the range.
 
+## Rate limits
+
+As with passwords, this repo owns the key strings and the 429 behaviour,
+not the numbers. Quotas are enforced by the harness `RateLimiter`
+adapter and set in deployment config; keys are
+`auth-magic-link:{key}` over `rate_limit_keys(ip, email)`. In-memory
+adapters are per-isolate (a Known gap below), so a multi-isolate
+deployment needs a KV-backed limiter. Every refusal is `429` with a
+`Retry-After`.
+
+| Scope | Recommended quota | Why |
+|---|---|---|
+| Request per IP | 5/10min | Every request can send a mail, so each one costs money and annoys somebody. 5 per 10 minutes is tighter than login for that reason, while still loose enough for shared addresses behind NAT. |
+| Request per normalised email, any IP | 3/hour | Caps one victim's inbox: nobody gets mail-bombed through this endpoint. Against the 15-minute link TTL it means roughly one live link at a time, and refusals are `429` either way — the limit check runs before the account lookup, so it cannot be used to probe whether an address has an account. |
+
+A password lockout does not block this route: the lockout freezes the
+password row only, and a magic-link sign-in bypasses it without clearing
+it — the freeze ages out on its own. See the "Rate limits" section in
+`../auth-password/README.md` for the full lockout story.
+
+Captcha, where the port is present, is required on `POST /request`,
+with the same fail-closed behaviour as login.
+
 **Registration is off by default and that is deliberate.** With it on,
 anyone can create an account for any address they can type. A venture that
 wants passwordless sign-up turns it on knowing that.
