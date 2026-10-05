@@ -1,3 +1,6 @@
+> [!IMPORTANT]
+> **Archived.** This service now lives in [Cratefield/harness](https://github.com/Cratefield/harness) as the `cratefield-auth-*` crates ([#778](https://github.com/Cratefield/harness/pull/778)). Each app runs its own branded instance, self-hosted or managed by Cratefield; see [`docs/auth/MANAGED-INSTANCES.md`](https://github.com/Cratefield/harness/blob/main/docs/auth/MANAGED-INSTANCES.md). The shared `auth.factory0.ventures` was never deployed. A single login across studio apps is planned as federation in [Cratefield/harness#779](https://github.com/Cratefield/harness/issues/779).
+
 <p align="center">
   <img src="assets/readme-banner.png" alt="Factory Zero Auth. One login. Every venture. Six ways in, one session." width="100%">
 </p>
